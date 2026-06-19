@@ -133,15 +133,22 @@ install_global() {
         *)
             echo -e "${YELLOW}Installing to /usr/local/bin/...${NC}"
             sudo cp "$TARGET_DIR/target/release/terminal_ai_agent" /usr/local/bin/
+            # Install an `ask` wrapper so `ask <query>` works immediately
+            sudo tee /usr/local/bin/ask > /dev/null << 'SCRIPT'
+#!/usr/bin/env bash
+exec /usr/local/bin/terminal_ai_agent "$@"
+SCRIPT
+            sudo chmod +x /usr/local/bin/ask
             echo -e "${GREEN}Installed to /usr/local/bin/terminal_ai_agent${NC}"
+            echo -e "${GREEN}Installed ask wrapper to /usr/local/bin/ask${NC}"
             ;;
     esac
 }
 
 # --------------------------------------------------
-# Install shell function `ask()` in .bashrc / .zshrc
+# Optional: add ask() to shell rc for convenience in new terminals
 # --------------------------------------------------
-setup_shell_alias() {
+setup_rc_alias() {
     local rc
     case "$SHELL" in
         *zsh) rc="$HOME/.zshrc" ;;
@@ -149,21 +156,18 @@ setup_shell_alias() {
         *) rc="$HOME/.profile" ;;
     esac
 
-    # Only add to file if not already present
-    if ! grep -q "terminal_ai_agent" "$rc" 2>/dev/null; then
-        cat >> "$rc" << 'EOF'
+    if grep -q "terminal_ai_agent" "$rc" 2>/dev/null; then
+        return
+    fi
+
+    cat >> "$rc" << 'EOF'
 
 # Terminal AI Agent — quick ask() shortcut
 ask() {
     /usr/local/bin/terminal_ai_agent "$@"
 }
 EOF
-        echo -e "${GREEN}Added ask() function to $rc${NC}"
-    fi
-
-    # Make it available immediately in the current shell
-    ask() { /usr/local/bin/terminal_ai_agent "$@"; }
-    echo -e "${GREEN}ask() is now active in this terminal.${NC}"
+    echo -e "${GREEN}Also added ask() to $rc for new terminals.${NC}"
 }
 
 # --------------------------------------------------
@@ -201,5 +205,5 @@ install_rust
 source "$HOME/.cargo/env" 2>/dev/null || true
 build_project
 install_global
-setup_shell_alias
+setup_rc_alias
 next_steps
