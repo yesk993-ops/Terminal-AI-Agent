@@ -70,7 +70,6 @@ install_deps() {
             sudo apk add curl pkgconfig openssl-dev build-base git
             ;;
         macos)
-            # Xcode CLT are usually installed by rustup; just ensure git is present
             if ! command -v git &>/dev/null; then
                 xcode-select --install 2>/dev/null || true
             fi
@@ -79,6 +78,7 @@ install_deps() {
             echo -e "${YELLOW}On Windows, ensure you have:${NC}"
             echo "  - Git for Windows (https://git-scm.com)"
             echo "  - Rust from https://rustup.rs"
+            echo "  - Node.js from https://nodejs.org (for OpenCode gateway)"
             echo "  - The Visual Studio C++ Build Tools (prompted by rustup)"
             echo ""
             echo "Then run this script again inside Git Bash or WSL."
@@ -99,6 +99,138 @@ install_rust() {
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
         source "$HOME/.cargo/env"
         echo -e "${GREEN}Rust installed.${NC}"
+    fi
+}
+
+# --------------------------------------------------
+# Install Node.js if missing
+# --------------------------------------------------
+install_node() {
+    if command -v node &>/dev/null; then
+        NODE_VER=$(node --version)
+        echo -e "${GREEN}Node.js $NODE_VER already installed.${NC}"
+    else
+        echo -e "${YELLOW}Installing Node.js...${NC}"
+        case "$DISTRO" in
+            debian)
+                curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+                sudo apt-get install -y -qq nodejs
+                ;;
+            fedora)
+                curl -fsSL https://rpm.nodesource.com/setup_22.x | sudo -E bash -
+                sudo dnf install -y nodejs
+                ;;
+            arch)
+                sudo pacman -S --noconfirm nodejs npm
+                ;;
+            macos)
+                if command -v brew &>/dev/null; then
+                    brew install node
+                else
+                    curl -fsSL https://nodejs.org/dist/v22.14.0/node-v22.14.0-darwin-x64.tar.gz | sudo tar -xz -C /usr/local --strip-components=1
+                fi
+                ;;
+            alpine)
+                sudo apk add nodejs npm
+                ;;
+        esac
+        echo -e "${GREEN}Node.js installed.${NC}"
+    fi
+}
+
+# --------------------------------------------------
+# Install OpenCode CLI + opencode-to-openai gateway
+# --------------------------------------------------
+install_opencode_gateway() {
+    local GATEWAY_DIR="$HOME/.opencode-gateway"
+
+    # Install OpenCode CLI via official script
+    if ! command -v opencode &>/dev/null; then
+        echo -e "${YELLOW}Installing OpenCode CLI...${NC}"
+        curl -fsSL https://opencode.ai/install | bash 2>/dev/null || {
+            echo -e "${YELLOW}Falling back to npm install...${NC}"
+            npm install -g opencode-ai
+        }
+        echo -e "${GREEN}OpenCode CLI installed.${NC}"
+    else
+        echo -e "${GREEN}OpenCode CLI already installed.${NC}"
+    fi
+
+    # Clone / update gateway
+    if [ -d "$GATEWAY_DIR" ]; then
+        echo -e "${YELLOW}Updating opencode-to-openai gateway...${NC}"
+        cd "$GATEWAY_DIR" && git pull --ff-only
+    else
+        echo -e "${YELLOW}Cloning opencode-to-openai gateway...${NC}"
+        git clone --depth 1 https://github.com/dxxzst/opencode-to-openai.git "$GATEWAY_DIR"
+        cd "$GATEWAY_DIR"
+    fi
+
+    cd "$GATEWAY_DIR"
+    if [ ! -d node_modules ]; then
+        echo -e "${YELLOW}Installing gateway dependencies...${NC}"
+        npm install
+    fi
+
+    # Create a systemd user service (Linux) or launchd plist (macOS) for autostart
+    case "$DISTRO" in
+        debian|fedora|arch|gentoo|suse|alpine)
+            local SERVICE_DIR="$HOME/.config/systemd/user"
+            mkdir -p "$SERVICE_DIR"
+            cat > "$SERVICE_DIR/opencode-gateway.service" << 'SERVICE'
+[Unit]
+Description=OpenCode-to-OpenAI API Gateway
+After=network.target
+
+[Service]
+ExecStart=%h/.opencode-gateway/node index.js
+WorkingDirectory=%h/.opencode-gateway
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+SERVICE
+            systemctl --user daemon-reload 2>/dev/null || true
+            systemctl --user enable --now opencode-gateway.service 2>/dev/null || true
+            echo -e "${GREEN}Gateway systemd service installed and started.${NC}"
+            ;;
+        macos)
+            mkdir -p "$HOME/Library/LaunchAgents"
+            cat > "$HOME/Library/LaunchAgents/com.opencode-gateway.plist" << 'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.opencode-gateway</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>index.js</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>%h/.opencode-gateway</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+PLIST
+            launchctl load "$HOME/Library/LaunchAgents/com.opencode-gateway.plist" 2>/dev/null || true
+            echo -e "${GREEN}Gateway launchd plist installed and started.${NC}"
+            ;;
+    esac
+
+    # Also start immediately (in case service didn't, or on unsupported platforms)
+    cd "$GATEWAY_DIR"
+    nohup node index.js > /dev/null 2>&1 &
+    sleep 1
+    if curl -sf http://127.0.0.1:8083/health > /dev/null 2>&1; then
+        echo -e "${GREEN}OpenCode gateway is running at http://127.0.0.1:8083${NC}"
+    else
+        echo -e "${YELLOW}Gateway may take a moment to start. Try: curl http://127.0.0.1:8083/health${NC}"
     fi
 }
 
@@ -181,19 +313,26 @@ next_steps() {
     echo ""
     echo -e "Run: ${CYAN}ask 'your question'${NC}"
     echo ""
+    echo -e "OpenCode gateway is running at ${CYAN}http://127.0.0.1:8083${NC}"
+    echo -e "  → Free models available immediately: opencode/big-pickle, opencode/gpt-5-nano"
+    echo ""
 
     if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -z "${GROQ_API_KEY:-}" ]; then
-        echo -e "${YELLOW}Next: set at least one API key:${NC}"
+        echo -e "${YELLOW}No API keys set — using OpenCode gateway + any env vars found.${NC}"
         echo ""
+        echo -e "Optionally set keys for more providers:"
         echo "  export OPENROUTER_API_KEY=\"sk-or-v1-...\""
-        echo "  # or"
         echo "  export GROQ_API_KEY=\"gsk_...\""
+        echo "  export GOOGLE_API_KEY=\"...\""
+        echo "  export NVIDIA_API_KEY=\"nvapi-...\""
         echo ""
-        echo -e "Add the line above to ${CYAN}~/.bashrc${NC} (or ${CYAN}~/.zshrc${NC}) to persist."
+        echo -e "Add to ${CYAN}~/.bashrc${NC} (or ${CYAN}~/.zshrc${NC}) to persist."
         echo ""
-        echo "Get a free key at:"
+        echo "Get free keys:"
         echo "  https://openrouter.ai/keys"
         echo "  https://console.groq.com/keys"
+        echo "  https://aistudio.google.com/apikey"
+        echo "  https://build.nvidia.com"
     fi
 }
 
@@ -202,8 +341,10 @@ next_steps() {
 # --------------------------------------------------
 install_deps
 install_rust
+install_node
 source "$HOME/.cargo/env" 2>/dev/null || true
 build_project
 install_global
+install_opencode_gateway
 setup_rc_alias
 next_steps
