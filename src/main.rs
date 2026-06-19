@@ -2,20 +2,22 @@ use colored::*;
 use terminal_ai_agent::*;
 use tokio::io::AsyncBufReadExt;
 
-/// Parses CLI arguments. Returns (query, temperature).
-fn parse_args() -> (String, f32) {
+/// Parses CLI arguments. Returns (query, temperature, code_mode).
+fn parse_args() -> (String, f32, bool) {
     let raw: Vec<String> = std::env::args().collect();
     let mut query = String::new();
-    let mut temperature = 0.3f32;
+    let mut temperature = 0.8f32;
+    let mut code_mode = false;
     let mut i = 1;
     while i < raw.len() {
         match raw[i].as_str() {
             "--temperature" | "--temp" => {
                 if i + 1 < raw.len() {
-                    temperature = raw[i + 1].parse().unwrap_or(0.3);
+                    temperature = raw[i + 1].parse().unwrap_or(0.8);
                     i += 1;
                 }
             }
+            "--code" => code_mode = true,
             _ => {
                 if !query.is_empty() {
                     query.push(' ');
@@ -25,7 +27,7 @@ fn parse_args() -> (String, f32) {
         }
         i += 1;
     }
-    (query, temperature.clamp(0.0, 2.0))
+    (query, temperature.clamp(0.0, 2.0), code_mode)
 }
 
 #[tokio::main]
@@ -37,22 +39,36 @@ async fn main() {
     // Ctrl+C handler
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            eprintln!("[warn] Failed to register Ctrl+C handler: {}", e);
+        }
         let _ = shutdown_tx.send(());
     });
 
-    let (query, temperature) = parse_args();
+    let (query, temperature, code_mode) = parse_args();
     if !query.is_empty() {
-        process_query(&client, &query, temperature).await;
+        if code_mode {
+            process_code_query(&client, &query, temperature).await;
+        } else {
+            process_query(&client, &query, temperature).await;
+        }
         save_conversation();
         return;
     }
 
+    if code_mode {
+        clear_conversation();
+    }
+
     println!(
         "{}",
-        "Terminal AI Agent (type 'exit' to quit)"
-            .green()
-            .bold()
+        if code_mode {
+            "Terminal AI Agent - Coding Mode (type 'exit' to quit)"
+        } else {
+            "Terminal AI Agent (type 'exit' to quit)"
+        }
+        .green()
+        .bold()
     );
 
     let stdin = tokio::io::stdin();
@@ -68,7 +84,14 @@ async fn main() {
                 break;
             }
             line = lines.next_line() => {
-                match line.unwrap_or(None) {
+                let line = match line {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("[error] Failed to read stdin: {}", e);
+                        break;
+                    }
+                };
+                match line {
                     None => {
                         println!();
                         break;
@@ -88,7 +111,11 @@ async fn main() {
                                 eprintln!("{}", "Usage: ask <your question>".red());
                                 continue;
                             }
-                            process_query(&client, q, temperature).await;
+                            if code_mode {
+                                process_code_query(&client, q, temperature).await;
+                            } else {
+                                process_query(&client, q, temperature).await;
+                            }
                             save_conversation();
                         } else {
                             eprintln!(
