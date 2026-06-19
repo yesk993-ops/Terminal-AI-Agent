@@ -335,10 +335,16 @@ fn shell_cmd_re() -> &'static Regex {
     &RE
 }
 
+fn acronym_re() -> &'static Regex {
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[A-Z]{2,}\s*\([^)]+\)").unwrap());
+    &RE
+}
+
 /// Renders a model response into a bordered string with ANSI color codes.
 ///
 /// * Strips markdown formatting (`**bold**`, `### headings`, `` `inline code` ``, `* list`)
 /// * Applies colors: bold cyan for key terms, dark green for headings,
+///   gold for acronym definitions (e.g. `SLA (Service Level Agreement)`),
 ///   amber for code blocks, green for inline commands
 /// * Wraps text to terminal width
 /// * Adds a horizontal rule top and bottom (no side walls) for easy copy-paste
@@ -351,6 +357,7 @@ pub fn format_response(resp: &str) -> String {
     let h_re = heading_re();
     let ic_re = inline_code_re();
     let sc_re = shell_cmd_re();
+    let ac_re = acronym_re();
     let a_re = ansi_re();
     let mut in_code = false;
 
@@ -374,6 +381,7 @@ pub fn format_response(resp: &str) -> String {
             || trimmed.starts_with("## ")
             || trimmed.starts_with("# ");
         let is_shell_cmd = sc_re.is_match(raw_line);
+        let is_acronym = ac_re.is_match(raw_line);
 
         let raw_stripped = h_re.replace_all(raw_line, "");
         let raw_stripped = list_star_re().replace_all(&raw_stripped, "");
@@ -401,6 +409,11 @@ pub fn format_response(resp: &str) -> String {
                     format!("\x1b[1;36m{}\x1b[0m", &caps[1])
                 })
                 .to_string();
+            if is_acronym {
+                // Strip all ANSI codes then re-wrap in gold so it's pure
+                let stripped = a_re.replace_all(&processed, "").to_string();
+                processed = format!("\x1b[38;5;220m{}\x1b[0m", stripped);
+            }
             lines.push(processed);
         }
     }
