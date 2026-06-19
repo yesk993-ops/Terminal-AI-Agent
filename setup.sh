@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO="https://github.com/yesk993-ops/Terminal-AI-Agent.git"
-TARGET_DIR="$HOME/.terminal-ai-agent"
+TARGET_DIR="$HOME/terminal-ai-agent"
 
 GREEN='\033[0;32m'
 CYAN='\033[1;36m'
