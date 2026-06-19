@@ -16,12 +16,18 @@ use tokio::time::timeout;
 // Error types
 // ---------------------------------------------------------------------------
 
+/// Errors that can occur when calling an AI model API.
 #[derive(Debug)]
 pub enum ApiError {
+    /// Network-level failure (connection refused, DNS, etc.).
     Network(String),
+    /// The API returned an unsuccessful HTTP status code.
     Http { status: u16, detail: String },
+    /// The request timed out.
     Timeout,
+    /// Failed to parse the API response body.
     Parse(String),
+    /// The response contained no completion choices.
     NoChoices,
 }
 
@@ -49,9 +55,12 @@ impl std::error::Error for ApiError {}
 // Data structures
 // ---------------------------------------------------------------------------
 
+/// A single message in a chat conversation.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ChatMessage {
+    /// Role of the message author: `"user"`, `"assistant"`, or `"system"`.
     pub role: String,
+    /// The message text content.
     pub content: String,
 }
 
@@ -96,7 +105,7 @@ static GROQ_MODELS: &[&str] = &[
     "llama-3.1-8b-instant",
 ];
 
-/// Returns the OpenRouter API key, or empty string if unset.
+/// Returns the OpenRouter API key from the `OPENROUTER_API_KEY` env var, or an empty string if unset.
 pub fn get_openrouter_key() -> String {
     std::env::var("OPENROUTER_API_KEY").unwrap_or_default()
 }
@@ -173,7 +182,10 @@ async fn call_api(
         .ok_or(ApiError::NoChoices)
 }
 
-/// OpenRouter API call.
+/// Calls the OpenRouter API for a single model.
+///
+/// Sends a chat completion request to `https://openrouter.ai/api/v1/chat/completions`
+/// with the given model, messages, and temperature.
 pub async fn call_openrouter(
     client: &Client,
     api_key: &str,
@@ -196,7 +208,10 @@ pub async fn call_openrouter(
     .await
 }
 
-/// Groq API call.
+/// Calls the Groq API for a single model.
+///
+/// Sends a chat completion request to `https://api.groq.com/openai/v1/chat/completions`
+/// with the given model, messages, and temperature.
 pub async fn call_groq(
     client: &Client,
     api_key: &str,
@@ -227,6 +242,9 @@ fn conv() -> std::sync::MutexGuard<'static, Vec<ChatMessage>> {
     CONVERSATION.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Appends a message to the in-memory conversation history.
+///
+/// Automatically trims history to the last 6 turns (12 messages) to keep context size manageable.
 pub fn push_conversation(msg: ChatMessage) {
     let mut c = conv();
     c.push(msg);
@@ -236,6 +254,7 @@ pub fn push_conversation(msg: ChatMessage) {
     }
 }
 
+/// Returns a copy of the current conversation history.
 pub fn conversation_history() -> Vec<ChatMessage> {
     conv().clone()
 }
@@ -247,6 +266,7 @@ fn history_path() -> PathBuf {
     dir.join("history.json")
 }
 
+/// Persists the current conversation history to disk at `~/.local/share/terminal_ai_agent/history.json`.
 pub fn save_conversation() {
     let path = history_path();
     if let Ok(data) = serde_json::to_string(&*conv()) {
@@ -254,6 +274,7 @@ pub fn save_conversation() {
     }
 }
 
+/// Loads a previously saved conversation from disk, replacing the current in-memory history.
 pub fn load_conversation() {
     let path = history_path();
     if let Ok(data) = std::fs::read_to_string(&path) {
@@ -315,6 +336,12 @@ fn shell_cmd_re() -> &'static Regex {
 }
 
 /// Renders a model response into a bordered string with ANSI color codes.
+///
+/// * Strips markdown formatting (`**bold**`, `### headings`, `` `inline code` ``, `* list`)
+/// * Applies colors: bold cyan for key terms, bold yellow for headings,
+///   amber for code blocks, green for inline commands
+/// * Wraps text to terminal width
+/// * Adds a horizontal rule top and bottom (no side walls) for easy copy-paste
 pub fn format_response(resp: &str) -> String {
     let term_w = safe_termwidth();
     let inner_w = term_w.saturating_sub(2).max(20);
@@ -400,7 +427,12 @@ pub fn format_response(resp: &str) -> String {
 
 type ModelResult = Result<String, (String, ApiError)>;
 
-/// Runs the query against all available models (OpenRouter + Groq) in parallel.
+/// Runs a user query against all available models (OpenRouter + Groq) in parallel.
+///
+/// The first model to return a valid response wins. The answer is printed to stdout
+/// with colored formatting. On total failure, an error message is printed to stderr.
+/// The user message is appended to conversation history before the call, and
+/// the assistant response is appended on success.
 pub async fn process_query(
     client: &Client,
     query: &str,
