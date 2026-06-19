@@ -1,8 +1,38 @@
 # Installation Guide
 
-## Prerequisites
+## Quick setup (all platforms, one command)
 
-### Step 1: Install Rust
+**Linux / macOS**
+```bash
+curl -fsSL https://raw.githubusercontent.com/yesk993-ops/Terminal-AI-Agent/main/setup.sh | bash
+```
+
+**Windows** — run inside [Git Bash](https://git-scm.com) or WSL:
+```bash
+curl -fsSL https://raw.githubusercontent.com/yesk993-ops/Terminal-AI-Agent/main/setup.sh | bash
+```
+
+The script will:
+1. Detect your OS (Debian/Ubuntu, Fedora, Arch, macOS, Windows)
+2. Install system dependencies (libssl, pkg-config, build tools)
+3. Install Rust via rustup (if not already present)
+4. Clone and build the project
+5. Install the binary to `/usr/local/bin/` (Linux/macOS)
+6. Print API key setup instructions
+
+After it finishes, set your API key and you're done:
+```bash
+export OPENROUTER_API_KEY="sk-or-v1-..."
+terminal_ai_agent "What is Rust?"
+```
+
+---
+
+## Manual installation
+
+### Prerequisites
+
+#### Step 1: Install Rust
 
 **Linux (any distro)**
 ```bash
