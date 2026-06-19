@@ -98,7 +98,7 @@ The agent starts all models from both providers simultaneously. Each has a 10-se
 | Element | Color | Purpose |
 |---|---|---|
 | **Bold text** `**term**` | Bold cyan | Key concepts |
-| Headings `### Title` | Bold yellow | Section breaks |
+| Headings `### Title` | Dark green | Section breaks |
 | Code blocks ` ``` ` | Amber | Scripts & multi-line code |
 | Inline commands `` `cmd` `` | Green | Commands, flags, paths |
 | Shell prompts `$ cmd` | Amber | Command-line examples |

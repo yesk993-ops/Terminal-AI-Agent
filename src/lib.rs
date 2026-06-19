@@ -338,7 +338,7 @@ fn shell_cmd_re() -> &'static Regex {
 /// Renders a model response into a bordered string with ANSI color codes.
 ///
 /// * Strips markdown formatting (`**bold**`, `### headings`, `` `inline code` ``, `* list`)
-/// * Applies colors: bold cyan for key terms, bold yellow for headings,
+/// * Applies colors: bold cyan for key terms, dark green for headings,
 ///   amber for code blocks, green for inline commands
 /// * Wraps text to terminal width
 /// * Adds a horizontal rule top and bottom (no side walls) for easy copy-paste
@@ -386,7 +386,7 @@ pub fn format_response(resp: &str) -> String {
         for sub in wrapped {
             let mut processed = sub;
             if is_heading {
-                processed = format!("\x1b[1;33m{}\x1b[0m", processed);
+                processed = format!("\x1b[38;5;22m{}\x1b[0m", processed);
             }
             if is_shell_cmd {
                 processed = format!("\x1b[0;33m{}\x1b[0m", processed);
