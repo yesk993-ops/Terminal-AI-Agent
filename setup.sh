@@ -149,20 +149,21 @@ setup_shell_alias() {
         *) rc="$HOME/.profile" ;;
     esac
 
-    # Only add if not already present
-    if grep -q "terminal_ai_agent" "$rc" 2>/dev/null; then
-        return
-    fi
-
-    cat >> "$rc" << 'EOF'
+    # Only add to file if not already present
+    if ! grep -q "terminal_ai_agent" "$rc" 2>/dev/null; then
+        cat >> "$rc" << 'EOF'
 
 # Terminal AI Agent — quick ask() shortcut
 ask() {
     /usr/local/bin/terminal_ai_agent "$@"
 }
 EOF
-    echo -e "${GREEN}Added ask() function to $rc${NC}"
-    echo -e "${YELLOW}Run: source $rc${NC}"
+        echo -e "${GREEN}Added ask() function to $rc${NC}"
+    fi
+
+    # Make it available immediately in the current shell
+    ask() { /usr/local/bin/terminal_ai_agent "$@"; }
+    echo -e "${GREEN}ask() is now active in this terminal.${NC}"
 }
 
 # --------------------------------------------------
