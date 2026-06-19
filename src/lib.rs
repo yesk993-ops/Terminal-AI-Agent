@@ -513,7 +513,8 @@ pub async fn process_query(
         }
     }
 
-    let mut last_err = (String::new(), ApiError::Timeout);
+    let mut attempts: Vec<String> = Vec::new();
+
     while let Some(result) = unordered.next().await {
         match result {
             Ok(resp) => {
@@ -526,18 +527,35 @@ pub async fn process_query(
                 println!("{}", format_response(&resp));
                 return;
             }
-            Err(e) => last_err = e,
+            Err(e) => {
+                attempts.push(format!("{}: {}", e.0, e.1));
+            }
         }
     }
 
-    // All failed
+    // All failed — show a helpful summary
     conv().pop();
-    eprintln!(
-        "{} {}: {}",
-        "All free models failed.".red(),
-        last_err.0.cyan(),
-        last_err.1.to_string().red()
-    );
+
+    let no_or = get_openrouter_key().is_empty();
+    let no_groq = get_groq_key().is_err();
+
+    eprintln!("{}", "All free models failed.".red());
+    for a in &attempts {
+        eprintln!("  {} {}", "•".yellow(), a.cyan());
+    }
+    if no_or && no_groq {
+        eprintln!(
+            "{}",
+            "No API keys set. Export OPENROUTER_API_KEY or GROQ_API_KEY."
+                .yellow()
+        );
+    } else if no_groq {
+        eprintln!(
+            "{} {}",
+            "Also set GROQ_API_KEY for faster fallback.".yellow(),
+            "(console.groq.com/keys)".cyan()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
