@@ -139,6 +139,33 @@ install_global() {
 }
 
 # --------------------------------------------------
+# Install shell function `ask()` in .bashrc / .zshrc
+# --------------------------------------------------
+setup_shell_alias() {
+    local rc
+    case "$SHELL" in
+        *zsh) rc="$HOME/.zshrc" ;;
+        *bash) rc="$HOME/.bashrc" ;;
+        *) rc="$HOME/.profile" ;;
+    esac
+
+    # Only add if not already present
+    if grep -q "terminal_ai_agent" "$rc" 2>/dev/null; then
+        return
+    fi
+
+    cat >> "$rc" << 'EOF'
+
+# Terminal AI Agent — quick ask() shortcut
+ask() {
+    /usr/local/bin/terminal_ai_agent "$@"
+}
+EOF
+    echo -e "${GREEN}Added ask() function to $rc${NC}"
+    echo -e "${YELLOW}Run: source $rc${NC}"
+}
+
+# --------------------------------------------------
 # Print next steps
 # --------------------------------------------------
 next_steps() {
@@ -147,7 +174,7 @@ next_steps() {
     echo -e "${GREEN}  Setup complete!${NC}"
     echo -e "${CYAN}========================================${NC}"
     echo ""
-    echo -e "Run: ${CYAN}terminal_ai_agent \"your question\"${NC}"
+    echo -e "Run: ${CYAN}ask 'your question'${NC}"
     echo ""
 
     if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -z "${GROQ_API_KEY:-}" ]; then
@@ -173,4 +200,5 @@ install_rust
 source "$HOME/.cargo/env" 2>/dev/null || true
 build_project
 install_global
+setup_shell_alias
 next_steps

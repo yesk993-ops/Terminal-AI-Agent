@@ -78,8 +78,12 @@ async fn main() {
                     Some(s) => {
                         let trimmed = s.trim();
                         let lower = trimmed.to_ascii_lowercase();
-                        if lower.starts_with("ask ") {
-                            let q = trimmed[4..].trim();
+                        if lower.starts_with("ask") {
+                            let q = if lower.len() > 3 && lower.as_bytes()[3] == b' ' {
+                                trimmed[4..].trim()
+                            } else {
+                                trimmed[3..].trim()
+                            };
                             if q.is_empty() {
                                 eprintln!("{}", "Usage: ask <your question>".red());
                                 continue;
