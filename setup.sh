@@ -235,61 +235,17 @@ PLIST
 }
 
 # --------------------------------------------------
-# Detect target triple
+# Clone / update repo and build
 # --------------------------------------------------
-detect_target() {
-    local arch
-    arch="$(uname -m)"
-    case "$arch" in
-        x86_64|amd64) arch="x86_64" ;;
-        aarch64|arm64) arch="aarch64" ;;
-        *) echo -e "${YELLOW}Unknown arch: $arch${NC}"; return 1 ;;
-    esac
-
-    case "$OS" in
-        Linux) echo "${arch}-unknown-linux-gnu" ;;
-        Darwin)
-            if [ "$arch" = "x86_64" ]; then
-                echo "x86_64-apple-darwin"
-            else
-                echo "aarch64-apple-darwin"
-            fi
-            ;;
-        MINGW*|MSYS*|CYGWIN*)
-            echo "x86_64-pc-windows-gnu" ;;
-        *) return 1 ;;
-    esac
-}
-
-# --------------------------------------------------
-# Download pre-built binary or fall back to source build
-# --------------------------------------------------
-download_or_build() {
-    local target
-    target="$(detect_target)" || true
-    local BIN_NAME="terminal_ai_agent"
-    local EXT=""
-    case "$OS" in MINGW*|MSYS*|CYGWIN*) EXT=".exe" ;; esac
-
-    # Try downloading pre-built binary first
-    if [ -n "$target" ]; then
-        local GH="https://github.com/yesk993-ops/Terminal-AI-Agent"
-        local URL="$GH/releases/latest/download/${BIN_NAME}-${target}${EXT}"
-        echo -e "${YELLOW}Downloading pre-built binary for ${target}...${NC}"
-        if curl -fsL -o "$TARGET_DIR/${BIN_NAME}${EXT}" "$URL"; then
-            chmod +x "$TARGET_DIR/${BIN_NAME}${EXT}"
-            echo -e "${GREEN}Downloaded ${BIN_NAME} for ${target}.${NC}"
-            return 0
-        fi
-        echo -e "${YELLOW}No pre-built binary available, building from source...${NC}"
-    fi
-
-    # Fall back to source build
-    if [ ! -d "$TARGET_DIR" ]; then
+build_project() {
+    if [ -d "$TARGET_DIR" ]; then
+        echo -e "${YELLOW}Updating existing clone...${NC}"
+        cd "$TARGET_DIR" && git pull --ff-only
+    else
         echo -e "${YELLOW}Cloning repository...${NC}"
         git clone --depth 1 "$REPO" "$TARGET_DIR"
+        cd "$TARGET_DIR"
     fi
-    cd "$TARGET_DIR"
 
     echo -e "${YELLOW}Building release binary (this may take a while)...${NC}"
     cargo build --release
@@ -300,29 +256,16 @@ download_or_build() {
 # Install globally (Linux/macOS)
 # --------------------------------------------------
 install_global() {
-    # Find the binary (downloaded path vs built path)
-    local BIN_SRC="$TARGET_DIR/terminal_ai_agent"
-    if [ ! -f "$BIN_SRC" ]; then
-        BIN_SRC="$TARGET_DIR/target/release/terminal_ai_agent"
-    fi
-    local EXT=""
-    case "$OS" in MINGW*|MSYS*|CYGWIN*) EXT=".exe" ; BIN_SRC="${BIN_SRC}${EXT}" ;; esac
-
-    if [ ! -f "$BIN_SRC" ]; then
-        echo -e "${YELLOW}Binary not found at $BIN_SRC${NC}"
-        return
-    fi
-
     case "$DISTRO" in
         windows)
-            echo -e "${YELLOW}Binary at: $BIN_SRC${NC}"
+            echo -e "${YELLOW}Binary at: $TARGET_DIR/target/release/terminal_ai_agent.exe${NC}"
             echo -e "${YELLOW}Add it to your PATH manually, or copy:${NC}"
-            echo "  copy \"$BIN_SRC\" \"C:\\Windows\\System32\\\""
+            echo "  copy \"$TARGET_DIR\\target\\release\\terminal_ai_agent.exe\" \"C:\\Windows\\System32\\\""
             ;;
         *)
             echo -e "${YELLOW}Installing to /usr/local/bin/...${NC}"
-            sudo cp "$BIN_SRC" /usr/local/bin/terminal_ai_agent$EXT
-            sudo chmod +x /usr/local/bin/terminal_ai_agent$EXT
+            sudo cp "$TARGET_DIR/target/release/terminal_ai_agent" /usr/local/bin/
+            sudo chmod +x /usr/local/bin/terminal_ai_agent
             # Install an `ask` wrapper so `ask <query>` works immediately
             sudo tee /usr/local/bin/ask > /dev/null << 'SCRIPT'
 #!/usr/bin/env bash
@@ -401,7 +344,7 @@ install_deps
 install_rust
 install_node
 source "$HOME/.cargo/env" 2>/dev/null || true
-download_or_build
+build_project
 install_global
 install_opencode_gateway
 setup_rc_alias
