@@ -1,7 +1,9 @@
 use serde_json::{json, Value};
 use std::process::Command as StdCommand;
+use std::time::Duration;
 
 use glob::glob as glob_match;
+use tokio::time::timeout;
 
 pub fn all_tool_defs() -> Vec<Value> {
     vec![
@@ -247,16 +249,19 @@ async fn exec_bash(args: &Value) -> String {
     };
     let cmd = cmd.to_string();
 
-    let output = tokio::task::spawn_blocking(move || {
-        StdCommand::new("sh")
-            .arg("-c")
-            .arg(&cmd)
-            .output()
-    })
+    let output = timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            StdCommand::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .output()
+        }),
+    )
     .await;
 
     match output {
-        Ok(Ok(out)) => {
+        Ok(Ok(Ok(out))) => {
             let mut result = String::new();
             if !out.stdout.is_empty() {
                 result.push_str(&String::from_utf8_lossy(&out.stdout));
@@ -277,8 +282,9 @@ async fn exec_bash(args: &Value) -> String {
             }
             result
         }
-        Ok(Err(e)) => format!("Command error: {}", e),
-        Err(_) => "Failed to spawn command".to_string(),
+        Ok(Ok(Err(e))) => format!("Command error: {}", e),
+        Ok(Err(_)) => "Failed to spawn command".to_string(),
+        Err(_) => "Command timed out after 30s".to_string(),
     }
 }
 

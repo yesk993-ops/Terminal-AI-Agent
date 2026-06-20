@@ -717,14 +717,25 @@ fn score_response(resp: &str) -> f64 {
 fn post_process_response(resp: &str) -> String {
     let mut result = String::with_capacity(resp.len());
 
-    // Remove common boilerplate prefixes
+    // Strip common boilerplate prefixes from line starts (case-insensitive)
     let stripped = resp
         .lines()
-        .filter(|line| {
+        .map(|line| {
             let lower = line.trim().to_lowercase();
-            !lower.starts_with("here is ") && !lower.starts_with("here are ")
-                && !lower.starts_with("sure,") && !lower.starts_with("of course,")
-                && !lower.starts_with("certainly,")
+            let trimmed = line.trim();
+            if lower.starts_with("here is ") {
+                trimmed[8..].trim_start()
+            } else if lower.starts_with("here are ") {
+                trimmed[9..].trim_start()
+            } else if lower.starts_with("sure, ") {
+                trimmed[6..].trim_start()
+            } else if lower.starts_with("of course, ") {
+                trimmed[11..].trim_start()
+            } else if lower.starts_with("certainly, ") {
+                trimmed[11..].trim_start()
+            } else {
+                line
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1039,20 +1050,17 @@ pub async fn process_query(
     let mut best_response: Option<String> = None;
     let mut best_score: f64 = 0.0;
     let mut attempts: Vec<String> = Vec::new();
-    let mut all_responses: Vec<(String, f64)> = Vec::new();
 
     while let Some(result) = unordered.next().await {
         match result {
             Ok(resp) => {
                 let processed = post_process_response(&resp);
                 let score = score_response(&processed);
-                all_responses.push((processed.clone(), score));
 
                 if score > best_score {
                     best_score = score;
                     best_response = Some(processed);
                 }
-                // Early exit if we got a good enough response
                 if best_score > 15.0 && best_response.is_some() {
                     break;
                 }
@@ -1233,7 +1241,6 @@ pub async fn process_code_query(
                         best_score = score;
                         best_resp = Some(resp);
                     }
-                    // Early exit for good enough responses
                     if best_score > 40.0 {
                         break;
                     }
@@ -1243,11 +1250,7 @@ pub async fn process_code_query(
                 }
             }
         }
-
-        // Drain remaining futures
-        if best_resp.is_some() {
-            while unordered.next().await.is_some() {}
-        }
+        // Drop remaining futures immediately — don't drain
 
         let resp = match best_resp {
             Some(r) => r,
@@ -1302,6 +1305,7 @@ pub async fn process_code_query(
             });
         } else {
             println!("{}", format_response(&resp));
+            save_conversation().await;
             return;
         }
     }
@@ -1340,13 +1344,15 @@ fn tool_call_re() -> &'static Regex {
 
 /// Extracts a balanced JSON object from `s` starting at the first `{`.
 /// Returns the slice covering the outermost `{...}` pair, handling nested
-/// braces and strings correctly.
+/// braces and strings correctly. Only returns Some if the JSON is followed
+/// by a closing `</` tag.
 fn extract_balanced_json(s: &str) -> Option<&str> {
     let start = s.find('{')?;
     let bytes = s.as_bytes();
     let mut depth = 0u32;
     let mut in_string = false;
     let mut escaped = false;
+    let mut end = None;
     for (i, &b) in bytes[start..].iter().enumerate() {
         if escaped {
             escaped = false;
@@ -1368,11 +1374,19 @@ fn extract_balanced_json(s: &str) -> Option<&str> {
         } else if b == b'}' {
             depth -= 1;
             if depth == 0 {
-                return Some(&s[start..start + i + 1]);
+                end = Some(start + i + 1);
+                break;
             }
         }
     }
-    None
+    let end = end?;
+    // Verify closing tag follows the JSON
+    let after = s[end..].trim_start();
+    if after.starts_with("</") {
+        Some(&s[start..end])
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

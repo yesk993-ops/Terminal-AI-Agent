@@ -20,7 +20,7 @@ fn parse_args() -> (String, f32, bool) {
                 std::process::exit(0);
             }
             "--temperature" | "--temp" => {
-                if i + 1 < raw.len() {
+                if i + 1 < raw.len() && !raw[i + 1].starts_with("--") {
                     temperature = raw[i + 1].parse().unwrap_or(0.8);
                     i += 1;
                 }
