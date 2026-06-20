@@ -121,33 +121,24 @@ struct ChatResponse {
 // ---------------------------------------------------------------------------
 
 static FREE_MODELS: &[&str] = &[
-    "deepseek/deepseek-chat-v3-0324:free",
-    "google/gemini-2.0-flash-exp:free",
-    "qwen/qwen3-235b-a22b:free",
+    "google/gemma-4-31b-it:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "qwen/qwen3-coder:free",
+    "openai/gpt-oss-20b:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
 ];
 
 static GROQ_MODELS: &[&str] = &[
     "llama-3.3-70b-versatile",
 ];
 
-static GOOGLE_MODELS: &[&str] = &[
-    "gemini-1.5-flash",
-    "gemini-2.0-flash-lite",
-];
+static GOOGLE_MODELS: &[&str] = &[];
 
-static NVIDIA_MODELS: &[&str] = &[
-    "nemotron-3-super",
-    "meta/llama-3.1-8b-instruct",
-];
+static NVIDIA_MODELS: &[&str] = &[];
 
 /// Free models available through the local `opencode-to-openai` gateway
 /// (no API key needed when the gateway is running).
-static OPENCODE_GATEWAY_MODELS: &[&str] = &[
-    "opencode/big-pickle",
-    "opencode/gpt-5-nano",
-    "opencode/minimax-m2.5-free",
-    "opencode/nemotron-3-super-free",
-];
+static OPENCODE_GATEWAY_MODELS: &[&str] = &[];
 
 /// Returns the OpenRouter API key from the `OPENROUTER_API_KEY` env var, or an empty string if unset.
 pub fn get_openrouter_key() -> String {
@@ -1141,14 +1132,29 @@ pub async fn process_query(
     let no_nvidia = nv_key.is_empty();
     let no_keys = no_or && no_groq && no_google && no_nvidia;
 
+    // Filter out noisy errors - only show real failures
+    let real_errors: Vec<&str> = attempts
+        .iter()
+        .filter(|a| !a.contains("opencode/"))
+        .filter(|a| !a.contains("Connection refused"))
+        .filter(|a| !a.contains("Timeout"))
+        .map(|s| s.as_str())
+        .collect();
+
     eprintln!("{}", "All free models failed.".red());
-    for a in &attempts {
+    for a in &real_errors {
         eprintln!("  {} {}", "•".yellow(), a.cyan());
     }
     if no_keys {
         eprintln!(
             "{}",
             "No API keys set. Export OPENROUTER_API_KEY, GROQ_API_KEY, GOOGLE_API_KEY, or NVIDIA_API_KEY."
+                .yellow()
+        );
+    } else if real_errors.is_empty() {
+        eprintln!(
+            "{}",
+            "Models may be rate-limited or unavailable. Try again in a moment."
                 .yellow()
         );
     } else {
