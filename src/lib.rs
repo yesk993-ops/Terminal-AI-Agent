@@ -1069,48 +1069,96 @@ pub async fn process_query(
     // Collect API keys once
     let ak = get_openrouter_key();
     let gk = get_groq_key();
-    let google_key = get_google_key();
-    let nv_key = get_nvidia_key();
+    let gk_val = gk.clone().unwrap_or_default();
 
-    let mut unordered = build_provider_futures(
-        client,
-        &messages,
-        effective_temp,
-        max_tokens,
-        Duration::from_secs(5),
-        Duration::from_secs(4),
-    );
-
-    // Early cancellation: return as soon as we get a good response (score > 15.0)
-    // or collect all and pick best
-    let mut best_response: Option<String> = None;
-    let mut best_score: f64 = 0.0;
+    // Sequential fallback: try one model at a time to avoid rate limiting
+    // Order: Groq (fastest) → OpenRouter models
+    let mut response: Option<String> = None;
     let mut attempts: Vec<String> = Vec::new();
+    let timeout_dur = Duration::from_secs(5);
 
-    while let Some(result) = unordered.next().await {
-        match result {
-            Ok(resp) => {
-                let processed = post_process_response(&resp);
-                let score = score_response(&processed);
-
-                if score > best_score {
-                    best_score = score;
-                    best_response = Some(processed);
+    // Helper to try a single model call with retry for 429s
+    async fn try_model<F, Fut>(f: F, model: &str, delay_ms: u64) -> (Option<String>, String)
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<String, ApiError>>,
+    {
+        let mut last_err = String::new();
+        for attempt in 0..2 {
+            let res = tokio::time::timeout(Duration::from_secs(5), f()).await;
+            match res {
+                Ok(Ok(resp)) => {
+                    return (Some(resp), String::new());
                 }
-                if best_score > 10.0 && best_response.is_some() {
+                Ok(Err(ApiError::Http { status: 429, .. })) => {
+                    last_err = format!("{}: Rate limited", model);
+                    if attempt == 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                }
+                Ok(Err(e)) => {
+                    last_err = format!("{}: {}", model, e);
+                    break;
+                }
+                Err(_) => {
+                    last_err = format!("{}: Timeout", model);
                     break;
                 }
             }
-            Err(e) => {
-                attempts.push(format!("{}: {}", e.0, e.1));
+        }
+        (None, last_err)
+    }
+
+    // 1. Try Groq first (fastest, ~200ms)
+    if response.is_none() && !gk_val.is_empty() {
+        for model in GROQ_MODELS {
+            let msgs = (*messages).clone();
+            let (resp, err) = try_model(
+                || call_groq(client, &gk_val, model, &msgs, effective_temp, max_tokens),
+                model,
+                500,
+            )
+            .await;
+            if let Some(r) = resp {
+                let processed = post_process_response(&r);
+                let score = score_response(&processed);
+                if score > 0.0 {
+                    response = Some(processed);
+                    break;
+                }
+                attempts.push(format!("{}: low quality (score {:.0})", model, score));
+            } else {
+                attempts.push(err);
             }
         }
     }
 
-    // If we broke early, don't drain - just drop the remaining futures
-    // to avoid blocking on slow/timeout models
+    // 2. Try OpenRouter models one at a time
+    if response.is_none() && !ak.is_empty() {
+        for model in get_models() {
+            let msgs = (*messages).clone();
+            let (resp, err) = try_model(
+                || call_openrouter(client, &ak, &model, &msgs, effective_temp, max_tokens),
+                &model,
+                1000,
+            )
+            .await;
+            if let Some(r) = resp {
+                let processed = post_process_response(&r);
+                let score = score_response(&processed);
+                if score > 0.0 {
+                    response = Some(processed);
+                    break;
+                }
+                attempts.push(format!("{}: low quality (score {:.0})", model, score));
+            } else {
+                attempts.push(err);
+            }
+        }
+    }
 
-    if let Some(best) = best_response {
+    if let Some(best) = response {
         let assistant = ChatMessage {
             role: "assistant".to_string(),
             content: Some(best.clone()),
@@ -1126,59 +1174,18 @@ pub async fn process_query(
     // All failed
     CONVERSATION.write().await.pop_back();
 
-    let no_or = ak.is_empty();
-    let no_groq = gk.is_err();
-    let no_google = google_key.is_empty();
-    let no_nvidia = nv_key.is_empty();
-    let no_keys = no_or && no_groq && no_google && no_nvidia;
-
-    // Filter out noisy errors - only show real failures
-    let real_errors: Vec<&str> = attempts
-        .iter()
-        .filter(|a| !a.contains("opencode/"))
-        .filter(|a| !a.contains("Connection refused"))
-        .filter(|a| !a.contains("Timeout"))
-        .map(|s| s.as_str())
-        .collect();
+    let no_keys = ak.is_empty() && gk.is_err();
 
     eprintln!("{}", "All free models failed.".red());
-    for a in &real_errors {
+    for a in &attempts {
         eprintln!("  {} {}", "•".yellow(), a.cyan());
     }
     if no_keys {
         eprintln!(
             "{}",
-            "No API keys set. Export OPENROUTER_API_KEY, GROQ_API_KEY, GOOGLE_API_KEY, or NVIDIA_API_KEY."
+            "No API keys set. Export OPENROUTER_API_KEY or GROQ_API_KEY."
                 .yellow()
         );
-    } else if real_errors.is_empty() {
-        eprintln!(
-            "{}",
-            "Models may be rate-limited or unavailable. Try again in a moment."
-                .yellow()
-        );
-    } else {
-        if no_groq {
-            eprintln!(
-                "{} {}",
-                "Also set GROQ_API_KEY for faster fallback.".yellow(),
-                "(console.groq.com/keys)".cyan()
-            );
-        }
-        if no_google {
-            eprintln!(
-                "{} {}",
-                "Also set GOOGLE_API_KEY for Gemini models.".yellow(),
-                "(aistudio.google.com/apikey)".cyan()
-            );
-        }
-        if no_nvidia {
-            eprintln!(
-                "{} {}",
-                "Also set NVIDIA_API_KEY for NIM models.".yellow(),
-                "(build.nvidia.com)".cyan()
-            );
-        }
     }
 }
 
