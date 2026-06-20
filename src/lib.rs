@@ -649,9 +649,9 @@ fn auto_max_tokens(query: &str) -> u32 {
     if word_count > 50 {
         4096
     } else if query.len() > 200 {
-        2048
+        4096
     } else {
-        1024
+        2048
     }
 }
 
@@ -1537,12 +1537,12 @@ mod tests {
 
     #[test]
     fn test_auto_max_tokens_short_query() {
-        assert_eq!(auto_max_tokens("hi"), 1024);
+        assert_eq!(auto_max_tokens("hi"), 2048);
     }
 
     #[test]
     fn test_auto_max_tokens_long_query() {
-        assert!(auto_max_tokens(&"word ".repeat(60)) >= 2048);
+        assert!(auto_max_tokens(&"word ".repeat(60)) >= 4096);
     }
 
     // -- score_response tests --
