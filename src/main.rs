@@ -68,7 +68,6 @@ async fn main() {
             "Terminal AI Agent (type 'exit' to quit)"
         }
         .green()
-        .bold()
     );
 
     let stdin = tokio::io::stdin();
@@ -80,7 +79,7 @@ async fn main() {
             _ = &mut shutdown_rx => {
                 println!("\n{}", "Saving conversation...".yellow());
                 save_conversation();
-                println!("{}", "Goodbye!".green().bold());
+                println!("{}", "Goodbye!".green());
                 break;
             }
             line = lines.next_line() => {

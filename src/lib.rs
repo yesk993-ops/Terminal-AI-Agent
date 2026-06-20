@@ -100,6 +100,7 @@ struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
     temperature: f32,
+    max_tokens: u32,
     stream: bool,
 }
 
@@ -209,11 +210,13 @@ async fn call_api(
     model: &str,
     messages: &[ChatMessage],
     temperature: f32,
+    max_tokens: u32,
 ) -> Result<String, ApiError> {
     let body = ChatRequest {
         model: model.to_string(),
         messages: messages.to_vec(),
         temperature,
+        max_tokens,
         stream: false,
     };
 
@@ -258,6 +261,7 @@ pub async fn call_openrouter(
     model: &str,
     messages: &[ChatMessage],
     temperature: f32,
+    max_tokens: u32,
 ) -> Result<String, ApiError> {
     let k = api_key.to_string();
     call_api(
@@ -271,6 +275,7 @@ pub async fn call_openrouter(
         model,
         messages,
         temperature,
+        max_tokens,
     )
     .await
 }
@@ -282,6 +287,7 @@ pub async fn call_groq(
     model: &str,
     messages: &[ChatMessage],
     temperature: f32,
+    max_tokens: u32,
 ) -> Result<String, ApiError> {
     let k = api_key.to_string();
     call_api(
@@ -291,6 +297,7 @@ pub async fn call_groq(
         model,
         messages,
         temperature,
+        max_tokens,
     )
     .await
 }
@@ -305,6 +312,7 @@ pub async fn call_google(
     model: &str,
     messages: &[ChatMessage],
     temperature: f32,
+    max_tokens: u32,
 ) -> Result<String, ApiError> {
     let k = api_key.to_string();
     call_api(
@@ -314,6 +322,7 @@ pub async fn call_google(
         model,
         messages,
         temperature,
+        max_tokens,
     )
     .await
 }
@@ -325,6 +334,7 @@ pub async fn call_nvidia(
     model: &str,
     messages: &[ChatMessage],
     temperature: f32,
+    max_tokens: u32,
 ) -> Result<String, ApiError> {
     let k = api_key.to_string();
     call_api(
@@ -334,6 +344,7 @@ pub async fn call_nvidia(
         model,
         messages,
         temperature,
+        max_tokens,
     )
     .await
 }
@@ -347,6 +358,7 @@ pub async fn call_opencode_gateway(
     model: &str,
     messages: &[ChatMessage],
     temperature: f32,
+    max_tokens: u32,
 ) -> Result<String, ApiError> {
     let base = get_opencode_gateway_url();
     let url = format!("{}/v1/chat/completions", base);
@@ -364,6 +376,7 @@ pub async fn call_opencode_gateway(
         model,
         messages,
         temperature,
+        max_tokens,
     )
     .await
 }
@@ -557,7 +570,7 @@ pub fn format_response(resp: &str) -> String {
                 .to_string();
             processed = b_re
                 .replace_all(&processed, |caps: &regex::Captures| {
-                    format!("\x1b[1;32m{}\x1b[0m", &caps[1])
+                    format!("\x1b[0;32m{}\x1b[0m", &caps[1])
                 })
                 .to_string();
             if is_acronym {
@@ -586,22 +599,249 @@ pub fn format_response(resp: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Quality helpers: temperature tuning, response scoring, post-processing
+// ---------------------------------------------------------------------------
+
+/// Detects the task type from the query and returns an optimized temperature.
+///
+/// Factual/analytical questions get lower temperature for accuracy.
+/// Creative/code tasks get moderate temperature.
+fn auto_temperature(query: &str) -> f32 {
+    let lower = query.to_lowercase();
+    let factual_keywords = [
+        "what is", "who is", "when did", "where is", "how many",
+        "define", "explain", "difference between", "compare",
+        "version", "release date", "population", "capital",
+    ];
+    let creative_keywords = [
+        "write", "create", "generate", "design", "imagine",
+        "poem", "story", "haiku", "song", "brainstorm",
+    ];
+    let code_keywords = [
+        "code", "function", "implement", "refactor", "debug",
+        "error", "bug", "fix", "algorithm", "compile", "rust",
+        "python", "javascript", "dockerfile", "git",
+    ];
+
+    if factual_keywords.iter().any(|k| lower.contains(k)) {
+        0.2
+    } else if code_keywords.iter().any(|k| lower.contains(k)) {
+        0.4
+    } else if creative_keywords.iter().any(|k| lower.contains(k)) {
+        0.8
+    } else {
+        0.5
+    }
+}
+
+/// Returns a default max_tokens value based on query complexity.
+fn auto_max_tokens(query: &str) -> u32 {
+    let word_count = query.split_whitespace().count();
+    if word_count > 50 {
+        4096
+    } else if query.len() > 200 {
+        2048
+    } else {
+        1024
+    }
+}
+
+/// Scores a response for quality. Higher is better.
+///
+/// Factors: length (not too short, not too long), presence of structure
+/// (headings, lists, code), and absence of refusals.
+fn score_response(resp: &str) -> f64 {
+    let len = resp.len() as f64;
+    let lines = resp.lines().count() as f64;
+
+    // Length score: penalize too short or too long
+    let length_score = if len < 20.0 {
+        len / 20.0 * 20.0
+    } else if len < 100.0 {
+        20.0 + (len - 20.0) / 80.0 * 30.0
+    } else if len < 3000.0 {
+        50.0
+    } else {
+        50.0 - ((len - 3000.0) / 3000.0 * 20.0).min(20.0)
+    };
+
+    // Structure score: headings, lists, code blocks, bold text
+    let mut structure = 0.0;
+    if resp.contains("### ") || resp.contains("## ") {
+        structure += 15.0;
+    }
+    if resp.contains("- ") || resp.contains("* ") {
+        structure += 10.0;
+    }
+    if resp.contains("```") {
+        structure += 10.0;
+    }
+    if resp.contains("**") {
+        structure += 5.0;
+    }
+    if lines > 3.0 {
+        structure += 5.0;
+    }
+
+    // Penalty for refusals / low-effort
+    let lower = resp.to_lowercase();
+    let refusal_phrases = [
+        "i cannot", "i can't", "i'm unable", "i am unable",
+        "as an ai", "i don't have", "i do not have",
+        "sorry, i", "unfortunately, i",
+    ];
+    let refusal_penalty: f64 = refusal_phrases
+        .iter()
+        .filter(|p| lower.contains(*p))
+        .map(|_| 30.0)
+        .sum();
+
+    (length_score + structure - refusal_penalty).max(0.0)
+}
+
+/// Post-processes a model response for display.
+///
+/// - Strips excessive blank lines
+/// - Removes trailing whitespace
+/// - Normalizes markdown list markers
+/// - Removes model self-identification boilerplate
+fn post_process_response(resp: &str) -> String {
+    let mut result = String::with_capacity(resp.len());
+
+    // Remove common boilerplate prefixes
+    let stripped = resp
+        .lines()
+        .filter(|line| {
+            let lower = line.trim().to_lowercase();
+            !lower.starts_with("here is ") && !lower.starts_with("here are ")
+                && !lower.starts_with("sure,") && !lower.starts_with("of course,")
+                && !lower.starts_with("certainly,")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Collapse 3+ blank lines into 2
+    let mut blank_count = 0u32;
+    for line in stripped.lines() {
+        if line.trim().is_empty() {
+            blank_count += 1;
+            if blank_count <= 2 {
+                result.push('\n');
+            }
+        } else {
+            blank_count = 0;
+            result.push_str(line.trim_end());
+            result.push('\n');
+        }
+    }
+
+    result.trim().to_string()
+}
+
+/// Summarizes old conversation messages to preserve key context.
+///
+/// Takes the oldest messages and compresses them into a summary message,
+/// keeping the most recent messages intact for continuity.
+fn summarize_old_context(messages: &[ChatMessage], keep_recent: usize) -> Vec<ChatMessage> {
+    if messages.len() <= keep_recent {
+        return messages.to_vec();
+    }
+
+    let old = &messages[..messages.len() - keep_recent];
+    let recent = &messages[messages.len() - keep_recent..];
+
+    // Extract key facts from old messages
+    let mut summary_parts: Vec<String> = Vec::new();
+    for msg in old {
+        if let Some(ref content) = msg.content {
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Keep first 100 chars of each old message as summary
+            if trimmed.len() > 100 {
+                summary_parts.push(format!("{}...", &trimmed[..100]));
+            } else {
+                summary_parts.push(trimmed.to_string());
+            }
+        }
+    }
+
+    if summary_parts.is_empty() {
+        return recent.to_vec();
+    }
+
+    let summary_text = format!(
+        "[Context from earlier conversation: {}]",
+        summary_parts.join("; ")
+    );
+
+    let mut result = vec![ChatMessage {
+        role: "system".to_string(),
+        content: Some(summary_text),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+    result.extend_from_slice(recent);
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Query processing
 // ---------------------------------------------------------------------------
 
 type ModelResult = Result<String, (String, ApiError)>;
 
-/// Runs a user query against all available models (OpenRouter + Groq) in parallel.
+/// Enhanced system prompt for chat mode — structured, detailed, high quality.
+fn chat_system_prompt() -> String {
+    r"You are a highly capable AI assistant. Follow these rules strictly:
+
+## Response quality
+- Lead with the direct answer, then explain if needed
+- Use concrete examples, numbers, and specific facts — avoid vague generalities
+- When comparing things, use a table or bullet points
+- For technical topics, include code examples where relevant
+- Keep responses focused — answer what was asked, nothing extra
+
+## Formatting
+- Use ### headings for major sections
+- Use **bold** for key terms on first mention
+- Use backtick-inline-code for commands, file paths, flags, and technical identifiers
+- Use triple-backtick code blocks for multi-line code, configs, or shell commands
+- Use - bullet points for lists of 3+ items
+- Use numbered lists for sequential steps
+
+## Personality
+- Be direct and confident — don't hedge with hedging phrases
+- Vary your examples and analogies each time
+- Match the depth to the question: simple question = simple answer
+- If the question is ambiguous, pick the most useful interpretation and answer it
+
+## What NOT to do
+- Don't start with filler phrases like Here is or Sure — just answer
+- Don't repeat the question back
+- Don't apologize or give disclaimers unless truly necessary
+- Don't include unnecessary preamble or closing remarks"
+        .to_string()
+}
+
+/// Runs a user query against all available models in parallel with best-of-N selection.
 ///
-/// The first model to return a valid response wins. The answer is printed to stdout
-/// with colored formatting. On total failure, an error message is printed to stderr.
-/// The user message is appended to conversation history before the call, and
-/// the assistant response is appended on success.
+/// Collects responses from all providers, scores them, and displays the highest quality one.
+/// Uses auto-tuned temperature and max_tokens based on query analysis.
 pub async fn process_query(
     client: &Client,
     query: &str,
     temperature: f32,
 ) {
+    let effective_temp = if (temperature - 0.8).abs() < 0.01 {
+        // User didn't override — use auto-tuning
+        auto_temperature(query)
+    } else {
+        temperature
+    };
+    let max_tokens = auto_max_tokens(query);
+
     let user_msg = ChatMessage {
         role: "user".to_string(),
         content: Some(query.to_string()),
@@ -610,18 +850,18 @@ pub async fn process_query(
     };
     let system_msg = ChatMessage {
         role: "system".to_string(),
-        content: Some(
-            "You are an expert assistant. Provide clear, concise, and correct answers. Vary your explanations each time — use different examples, analogies, or angles so the same question gets a fresh perspective."
-                .to_string(),
-        ),
+        content: Some(chat_system_prompt()),
         tool_calls: None,
         tool_call_id: None,
     };
 
     push_conversation(user_msg.clone());
 
+    let raw_history = conversation_history();
+    let history = summarize_old_context(&raw_history, 12);
+
     let mut messages = vec![system_msg];
-    messages.extend(conversation_history().iter().cloned());
+    messages.extend(history);
 
     let mut unordered: FuturesUnordered<
         Pin<Box<dyn std::future::Future<Output = ModelResult> + Send>>,
@@ -636,8 +876,8 @@ pub async fn process_query(
             let msgs = messages.clone();
             unordered.push(Box::pin(async move {
                 let res = timeout(
-                    Duration::from_secs(10),
-                    call_openrouter(&cl, &k, &model, &msgs, temperature),
+                    Duration::from_secs(12),
+                    call_openrouter(&cl, &k, &model, &msgs, effective_temp, max_tokens),
                 )
                 .await;
                 match res {
@@ -657,8 +897,8 @@ pub async fn process_query(
             let msgs = messages.clone();
             unordered.push(Box::pin(async move {
                 let res = timeout(
-                    Duration::from_secs(10),
-                    call_groq(&cl, &k, &model, &msgs, temperature),
+                    Duration::from_secs(12),
+                    call_groq(&cl, &k, &model, &msgs, effective_temp, max_tokens),
                 )
                 .await;
                 match res {
@@ -679,8 +919,8 @@ pub async fn process_query(
             let msgs = messages.clone();
             unordered.push(Box::pin(async move {
                 let res = timeout(
-                    Duration::from_secs(10),
-                    call_google(&cl, &k, &model, &msgs, temperature),
+                    Duration::from_secs(12),
+                    call_google(&cl, &k, &model, &msgs, effective_temp, max_tokens),
                 )
                 .await;
                 match res {
@@ -701,8 +941,8 @@ pub async fn process_query(
             let msgs = messages.clone();
             unordered.push(Box::pin(async move {
                 let res = timeout(
-                    Duration::from_secs(10),
-                    call_nvidia(&cl, &k, &model, &msgs, temperature),
+                    Duration::from_secs(12),
+                    call_nvidia(&cl, &k, &model, &msgs, effective_temp, max_tokens),
                 )
                 .await;
                 match res {
@@ -724,7 +964,7 @@ pub async fn process_query(
             let base = get_opencode_gateway_url();
             let url = format!("{}/v1/chat/completions", base);
             let res = timeout(
-                Duration::from_secs(5),
+                Duration::from_secs(8),
                 call_api(
                     &cl,
                     &url,
@@ -737,7 +977,8 @@ pub async fn process_query(
                     },
                     &model,
                     &msgs,
-                    temperature,
+                    effective_temp,
+                    max_tokens,
                 ),
             )
             .await;
@@ -749,26 +990,38 @@ pub async fn process_query(
         }));
     }
 
+    // Collect all successful responses for best-of-N selection
+    let mut responses: Vec<(String, f64)> = Vec::new();
     let mut attempts: Vec<String> = Vec::new();
 
     while let Some(result) = unordered.next().await {
         match result {
             Ok(resp) => {
-                let assistant = ChatMessage {
-                    role: "assistant".to_string(),
-                    content: Some(resp.clone()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                };
-                push_conversation(assistant);
-                save_conversation();
-                println!("{}", format_response(&resp));
-                return;
+                let processed = post_process_response(&resp);
+                let score = score_response(&processed);
+                responses.push((processed, score));
             }
             Err(e) => {
                 attempts.push(format!("{}: {}", e.0, e.1));
             }
         }
+    }
+
+    if !responses.is_empty() {
+        // Pick the highest-scored response
+        responses.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let best = &responses[0].0;
+
+        let assistant = ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(best.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        push_conversation(assistant);
+        save_conversation();
+        println!("{}", format_response(best));
+        return;
     }
 
     // All failed — show a helpful summary
@@ -815,6 +1068,51 @@ pub async fn process_query(
     }
 }
 
+/// Enhanced system prompt for coding agent mode — detailed, structured, with error recovery.
+fn coding_system_prompt() -> String {
+    r#"You are an expert coding agent. You can read, write, edit files, run shell commands, search code, and find files.
+
+## Available tools
+- bash: Run shell commands. Args: { "command": "..." }
+- read_file: Read file contents. Args: { "path": "..." }
+- write_file: Create or overwrite a file. Args: { "path": "...", "content": "..." }
+- edit_file: Replace text in a file (exact match). Args: { "path": "...", "old_string": "...", "new_string": "..." }
+- grep: Search file contents with regex. Args: { "pattern": "...", "path": "...", "include": "..." }
+- glob: Find files by pattern. Args: { "pattern": "...", "path": "..." }
+- list_dir: List directory contents. Args: { "path": "..." }
+
+## How to use tools
+When you need a tool, respond with EXACTLY this format (one tag per tool call):
+<tool_call>{"name":"TOOL_NAME","arguments":{...}}</tool_call>
+
+Examples:
+<tool_call>{"name":"bash","arguments":{"command":"ls -la /tmp"}}</tool_call>
+<tool_call>{"name":"read_file","arguments":{"path":"src/main.rs"}}</tool_call>
+<tool_call>{"name":"grep","arguments":{"pattern":"fn main","path":"src","include":"*.rs"}}</tool_call>
+
+## Workflow
+1. Understand the task — read relevant files first if needed
+2. Plan your approach before acting
+3. Call one tool at a time, wait for the result
+4. Verify your work — check files after editing, run tests after changes
+5. If a tool call fails, analyze the error and try a different approach
+6. When done, provide a clear summary of what was done
+
+## Error recovery
+- If a file doesn't exist, check the path with list_dir or glob
+- If a command fails, read the error message carefully and fix the issue
+- If edit_file fails (old_string not found), read the file first to find the exact text
+- If you're stuck, try a different approach — don't repeat the same failing action
+
+## Rules
+- Always use absolute paths
+- Read files before editing them
+- After writing/editing a file, verify the change if possible
+- Don't describe what you would do — just do it
+- Keep tool call arguments as JSON strings"#
+        .to_string()
+}
+
 /// Runs a query in coding-agent mode with text-based tool calling.
 ///
 /// Uses a special prompt instructing the model to output tool calls in
@@ -825,25 +1123,16 @@ pub async fn process_code_query(
     query: &str,
     temperature: f32,
 ) {
-    let sys_prompt = format!(
-        "You are a coding agent with access to these tools:\n\
-         - bash: Run a bash command. Args: {{ \"command\": \"...\" }}\n\
-         - read_file: Read a file. Args: {{ \"path\": \"...\" }}\n\
-         - write_file: Write a file. Args: {{ \"path\": \"...\", \"content\": \"...\" }}\n\
-         - edit_file: Edit a file. Args: {{ \"path\": \"...\", \"old_string\": \"...\", \"new_string\": \"...\" }}\n\
-         - grep: Search code. Args: {{ \"pattern\": \"...\", \"path\": \"...\", \"include\": \"...\" }}\n\
-         - glob: Find files. Args: {{ \"pattern\": \"...\", \"path\": \"...\" }}\n\
-         - list_dir: List directory. Args: {{ \"path\": \"...\" }}\n\n\
-         When you need to use a tool, respond with EXACTLY:\n\
-         <tool_call>{{ \"name\": \"TOOL_NAME\", \"arguments\": {{...}} }}</tool_call>\n\n\
-         I will execute the tool and tell you the result. Then you can continue.\n\
-         When the task is complete, respond with a brief summary (no tool calls).\n\
-         Do NOT describe what you would do -- just call the tool."
-    );
+    let effective_temp = if (temperature - 0.8).abs() < 0.01 {
+        0.3
+    } else {
+        temperature
+    };
+    let max_tokens = 2048u32;
 
     let system_msg = ChatMessage {
         role: "system".to_string(),
-        content: Some(sys_prompt),
+        content: Some(coding_system_prompt()),
         tool_calls: None,
         tool_call_id: None,
     };
@@ -880,8 +1169,8 @@ pub async fn process_code_query(
                 let m2 = model.clone();
                 unordered.push(Box::pin(async move {
                     let res = timeout(
-                        Duration::from_secs(15),
-                        call_openrouter(&cl, &k, &model, &msgs, temperature),
+                        Duration::from_secs(20),
+                        call_openrouter(&cl, &k, &model, &msgs, effective_temp, max_tokens),
                     )
                     .await;
                     match res {
@@ -902,8 +1191,8 @@ pub async fn process_code_query(
                 let m2 = model.clone();
                 unordered.push(Box::pin(async move {
                     let res = timeout(
-                        Duration::from_secs(15),
-                        call_groq(&cl, &k, &model, &msgs, temperature),
+                        Duration::from_secs(20),
+                        call_groq(&cl, &k, &model, &msgs, effective_temp, max_tokens),
                     )
                     .await;
                     match res {
@@ -925,8 +1214,8 @@ pub async fn process_code_query(
                 let m2 = model.clone();
                 unordered.push(Box::pin(async move {
                     let res = timeout(
-                        Duration::from_secs(15),
-                        call_google(&cl, &k, &model, &msgs, temperature),
+                        Duration::from_secs(20),
+                        call_google(&cl, &k, &model, &msgs, effective_temp, max_tokens),
                     )
                     .await;
                     match res {
@@ -948,8 +1237,8 @@ pub async fn process_code_query(
                 let m2 = model.clone();
                 unordered.push(Box::pin(async move {
                     let res = timeout(
-                        Duration::from_secs(15),
-                        call_nvidia(&cl, &k, &model, &msgs, temperature),
+                        Duration::from_secs(20),
+                        call_nvidia(&cl, &k, &model, &msgs, effective_temp, max_tokens),
                     )
                     .await;
                     match res {
@@ -972,7 +1261,7 @@ pub async fn process_code_query(
                 let base = get_opencode_gateway_url();
                 let url = format!("{}/v1/chat/completions", base);
                 let res = timeout(
-                    Duration::from_secs(10),
+                    Duration::from_secs(15),
                     call_api(
                         &cl,
                         &url,
@@ -985,7 +1274,8 @@ pub async fn process_code_query(
                         },
                         &model,
                         &msgs,
-                        temperature,
+                        effective_temp,
+                        max_tokens,
                     ),
                 )
                 .await;
@@ -997,13 +1287,19 @@ pub async fn process_code_query(
             }));
         }
 
+        // Collect responses and pick best one
+        let mut best_resp: Option<String> = None;
+        let mut best_score: f64 = -1.0;
         let mut attempts: Vec<String> = Vec::new();
-        let mut response: Option<String> = None;
+
         while let Some(result) = unordered.next().await {
             match result {
                 Ok(resp) => {
-                    response = Some(resp);
-                    break;
+                    let score = score_response(&resp);
+                    if score > best_score {
+                        best_score = score;
+                        best_resp = Some(resp);
+                    }
                 }
                 Err((model, err)) => {
                     attempts.push(format!("{}: {}", model, err));
@@ -1011,7 +1307,7 @@ pub async fn process_code_query(
             }
         }
 
-        let resp = match response {
+        let resp = match best_resp {
             Some(r) => r,
             None => {
                 eprintln!("{}", "[code-agent] All models failed.".red());
@@ -1106,7 +1402,7 @@ mod tests {
         assert!(!result.contains("**bold**"));
         assert!(result.contains("bold"));
         // ANSI escape inserted
-        assert!(result.contains("\x1b[1;32m"));
+        assert!(result.contains("\x1b[0;32m"));
         assert!(result.contains("\x1b[0m"));
     }
 
@@ -1194,5 +1490,114 @@ mod tests {
         // Oldest messages should have been removed
         assert_eq!(hist[0].content.as_deref(), Some("msg 8"));
         assert_eq!(hist[11].content.as_deref(), Some("msg 19"));
+    }
+
+    // -- auto_temperature tests --
+
+    #[test]
+    fn test_auto_temperature_factual() {
+        assert!(auto_temperature("what is the capital of France") <= 0.3);
+    }
+
+    #[test]
+    fn test_auto_temperature_creative() {
+        assert!(auto_temperature("write a poem about the ocean") >= 0.7);
+    }
+
+    #[test]
+    fn test_auto_temperature_code() {
+        assert!(auto_temperature("implement a binary search in Rust") <= 0.5);
+    }
+
+    #[test]
+    fn test_auto_temperature_default() {
+        let temp = auto_temperature("tell me something interesting");
+        assert!(temp >= 0.3 && temp <= 0.8);
+    }
+
+    // -- auto_max_tokens tests --
+
+    #[test]
+    fn test_auto_max_tokens_short_query() {
+        assert_eq!(auto_max_tokens("hi"), 1024);
+    }
+
+    #[test]
+    fn test_auto_max_tokens_long_query() {
+        assert!(auto_max_tokens(&"word ".repeat(60)) >= 2048);
+    }
+
+    // -- score_response tests --
+
+    #[test]
+    fn test_score_response_empty() {
+        assert_eq!(score_response(""), 0.0);
+    }
+
+    #[test]
+    fn test_score_response_short() {
+        let score = score_response("Yes");
+        assert!(score > 0.0 && score < 30.0);
+    }
+
+    #[test]
+    fn test_score_response_structured() {
+        let resp = "### Heading\n\n- item 1\n- item 2\n\n```\ncode\n```";
+        let score = score_response(resp);
+        assert!(score > 50.0);
+    }
+
+    #[test]
+    fn test_score_response_refusal_penalty() {
+        let resp = "I cannot help with that request.";
+        let score = score_response(resp);
+        assert!(score < 10.0);
+    }
+
+    // -- post_process_response tests --
+
+    #[test]
+    fn test_post_process_strips_filler() {
+        let resp = "Here is the answer:\nFoo bar";
+        let result = post_process_response(resp);
+        assert!(!result.starts_with("Here is"));
+        assert!(result.contains("Foo bar"));
+    }
+
+    #[test]
+    fn test_post_process_collapses_blanks() {
+        let resp = "line1\n\n\n\n\n\n\nline2";
+        let result = post_process_response(resp);
+        // Should collapse 6 blank lines down to 2
+        assert!(!result.contains("\n\n\n\n"));
+    }
+
+    // -- summarize_old_context tests --
+
+    #[test]
+    fn test_summarize_old_context_no_op() {
+        let msgs = vec![
+            ChatMessage { role: "user".into(), content: Some("a".into()), tool_calls: None, tool_call_id: None },
+            ChatMessage { role: "assistant".into(), content: Some("b".into()), tool_calls: None, tool_call_id: None },
+        ];
+        let result = summarize_old_context(&msgs, 5);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_summarize_old_context_compression() {
+        let msgs: Vec<ChatMessage> = (0..20)
+            .map(|i| ChatMessage {
+                role: if i % 2 == 0 { "user".into() } else { "assistant".into() },
+                content: Some(format!("message {}", i)),
+                tool_calls: None,
+                tool_call_id: None,
+            })
+            .collect();
+        let result = summarize_old_context(&msgs, 4);
+        // Should have summary + 4 recent = 5
+        assert!(result.len() <= 5);
+        // Recent messages preserved
+        assert_eq!(result.last().unwrap().content.as_deref(), Some("message 19"));
     }
 }
