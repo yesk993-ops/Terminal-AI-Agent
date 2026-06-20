@@ -96,7 +96,7 @@ async fn main() {
         } else {
             process_query(&client, &query, temperature).await;
         }
-        save_conversation().await;
+        force_save_conversation().await;
         return;
     }
 
@@ -122,7 +122,7 @@ async fn main() {
         tokio::select! {
             _ = &mut shutdown_rx => {
                 println!("\n{}", "Saving conversation...".yellow());
-                save_conversation().await;
+                force_save_conversation().await;
                 println!("{}", "Goodbye!".green());
                 break;
             }
@@ -173,6 +173,6 @@ async fn main() {
         }
     }
 
-    save_conversation().await;
+    force_save_conversation().await;
     println!("{}", "Goodbye!".green());
 }

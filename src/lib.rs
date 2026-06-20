@@ -381,7 +381,12 @@ pub async fn call_opencode_gateway(
 static CONVERSATION: LazyLock<RwLock<VecDeque<ChatMessage>>> =
     LazyLock::new(|| RwLock::new(VecDeque::new()));
 
+/// Query counter for debouncing saves — only writes to disk every N queries.
+static QUERY_COUNT: LazyLock<std::sync::atomic::AtomicU32> =
+    LazyLock::new(|| std::sync::atomic::AtomicU32::new(0));
+
 const MAX_TURNS: usize = 12;
+const SAVE_EVERY: u32 = 5;
 
 /// Appends a message to the in-memory conversation history.
 ///
@@ -420,8 +425,36 @@ fn history_path() -> &'static PathBuf {
     &PATH
 }
 
-/// Persists the current conversation history to disk (non-blocking).
+/// Persists the current conversation history to disk (non-blocking, debounced).
+///
+/// Only writes every 5th query to avoid blocking the main thread on disk I/O.
 pub async fn save_conversation() {
+    use std::sync::atomic::Ordering;
+    let count = QUERY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count % SAVE_EVERY != 0 {
+        return;
+    }
+    let path = history_path().clone();
+    let data = {
+        let c = CONVERSATION.read().await;
+        serde_json::to_string(&*c).ok()
+    };
+    if let Some(data) = data {
+        tokio::task::spawn_blocking(move || {
+            let _ = std::fs::write(&path, &data);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        })
+        .await
+        .ok();
+    }
+}
+
+/// Force-save conversation to disk (used on exit/shutdown).
+pub async fn force_save_conversation() {
     let path = history_path().clone();
     let data = {
         let c = CONVERSATION.read().await;
@@ -553,6 +586,7 @@ pub fn format_response(resp: &str) -> String {
         let is_heading = trimmed.starts_with("### ")
             || trimmed.starts_with("## ")
             || trimmed.starts_with("# ");
+        let is_bullet = trimmed.starts_with("- ") || trimmed.starts_with("* ");
         let is_shell_cmd = sc_re.is_match(raw_line);
         let is_acronym = ac_re.is_match(raw_line);
 
@@ -567,7 +601,11 @@ pub fn format_response(resp: &str) -> String {
         for sub in wrapped {
             let mut processed = sub;
             if is_heading {
-                processed = format!("\x1b[32m{}\x1b[0m", processed);
+                // Headings: bold + italic + underline + bright green
+                processed = format!("\x1b[1;3;4;92m{}\x1b[0m", processed);
+            } else if is_bullet {
+                // Bullet points: italic + underline + green
+                processed = format!("\x1b[3;4;32m{}\x1b[0m", processed);
             }
             if is_shell_cmd {
                 processed = format!("\x1b[0;32m{}\x1b[0m", processed);
@@ -579,11 +617,11 @@ pub fn format_response(resp: &str) -> String {
                 .to_string();
             processed = b_re
                 .replace_all(&processed, |caps: &regex::Captures| {
-                    format!("\x1b[0;32m{}\x1b[0m", &caps[1])
+                    // Bold text: bold + italic + underline + bright green
+                    format!("\x1b[1;3;4;92m{}\x1b[0m", &caps[1])
                 })
                 .to_string();
             if is_acronym {
-                // Strip all ANSI codes then re-wrap in gold so it's pure
                 let stripped = a_re.replace_all(&processed, "").to_string();
                 processed = format!("\x1b[38;5;220m{}\x1b[0m", stripped);
             }
@@ -812,9 +850,10 @@ fn summarize_old_context(messages: &[ChatMessage], keep_recent: usize) -> Vec<Ch
 
 type ModelResult = Result<String, (String, ApiError)>;
 
-/// Enhanced system prompt for chat mode — structured, detailed, high quality.
-fn chat_system_prompt() -> String {
-    r"You are a highly capable AI assistant. Follow these rules strictly:
+/// Cached system prompt — built once, reused on every query.
+fn chat_system_prompt() -> &'static str {
+    static PROMPT: LazyLock<String> = LazyLock::new(|| {
+        r"You are a highly capable AI assistant. Follow these rules strictly:
 
 ## Response quality
 - Lead with the direct answer, then explain if needed
@@ -842,7 +881,9 @@ fn chat_system_prompt() -> String {
 - Don't repeat the question back
 - Don't apologize or give disclaimers unless truly necessary
 - Don't include unnecessary preamble or closing remarks"
-        .to_string()
+            .to_string()
+    });
+    &PROMPT
 }
 
 /// Builds a FuturesUnordered containing requests to all configured providers.
@@ -868,6 +909,51 @@ fn build_provider_futures(
     let nv_key = get_nvidia_key();
     let gw_key = std::env::var("OPENCODE_GATEWAY_KEY").unwrap_or_default();
 
+    // Groq first — fastest provider (~200ms), best chance of early exit
+    if !gk_val.is_empty() {
+        for m in GROQ_MODELS {
+            let model = m.to_string();
+            let cl = client.clone();
+            let k = gk_val.clone();
+            let msgs = Arc::clone(messages);
+            unordered.push(Box::pin(async move {
+                let res = timeout(
+                    provider_timeout,
+                    call_groq(&cl, &k, &model, &msgs, temperature, max_tokens),
+                )
+                .await;
+                match res {
+                    Ok(Ok(resp)) => Ok(resp),
+                    Ok(Err(e)) => Err((model, e)),
+                    Err(_) => Err((model, ApiError::Timeout)),
+                }
+            }));
+        }
+    }
+
+    // Google Gemini — fast (~300ms)
+    if !google_key.is_empty() {
+        for m in GOOGLE_MODELS {
+            let model = m.to_string();
+            let cl = client.clone();
+            let k = google_key.clone();
+            let msgs = Arc::clone(messages);
+            unordered.push(Box::pin(async move {
+                let res = timeout(
+                    provider_timeout,
+                    call_google(&cl, &k, &model, &msgs, temperature, max_tokens),
+                )
+                .await;
+                match res {
+                    Ok(Ok(resp)) => Ok(resp),
+                    Ok(Err(e)) => Err((model, e)),
+                    Err(_) => Err((model, ApiError::Timeout)),
+                }
+            }));
+        }
+    }
+
+    // OpenRouter — slower (~500ms+) but more models
     if !ak.is_empty() {
         let models = get_models();
         for m in models {
@@ -890,48 +976,7 @@ fn build_provider_futures(
         }
     }
 
-    if !gk_val.is_empty() {
-        for m in GROQ_MODELS {
-            let model = m.to_string();
-            let cl = client.clone();
-            let k = gk_val.clone();
-            let msgs = Arc::clone(messages);
-            unordered.push(Box::pin(async move {
-                let res = timeout(
-                    provider_timeout,
-                    call_groq(&cl, &k, &model, &msgs, temperature, max_tokens),
-                )
-                .await;
-                match res {
-                    Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(e)) => Err((model, e)),
-                    Err(_) => Err((model, ApiError::Timeout)),
-                }
-            }));
-        }
-    }
-
-    if !google_key.is_empty() {
-        for m in GOOGLE_MODELS {
-            let model = m.to_string();
-            let cl = client.clone();
-            let k = google_key.clone();
-            let msgs = Arc::clone(messages);
-            unordered.push(Box::pin(async move {
-                let res = timeout(
-                    provider_timeout,
-                    call_google(&cl, &k, &model, &msgs, temperature, max_tokens),
-                )
-                .await;
-                match res {
-                    Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(e)) => Err((model, e)),
-                    Err(_) => Err((model, ApiError::Timeout)),
-                }
-            }));
-        }
-    }
-
+    // NVIDIA — slower (~1s+)
     if !nv_key.is_empty() {
         for m in NVIDIA_MODELS {
             let model = m.to_string();
@@ -953,7 +998,7 @@ fn build_provider_futures(
         }
     }
 
-    // OpenCode gateway
+    // OpenCode gateway — local, variable latency
     for m in OPENCODE_GATEWAY_MODELS {
         let model = m.to_string();
         let cl = client.clone();
@@ -1016,7 +1061,7 @@ pub async fn process_query(
     };
     let system_msg = ChatMessage {
         role: "system".to_string(),
-        content: Some(chat_system_prompt()),
+        content: Some(chat_system_prompt().to_string()),
         tool_calls: None,
         tool_call_id: None,
     };
@@ -1041,8 +1086,8 @@ pub async fn process_query(
         &messages,
         effective_temp,
         max_tokens,
-        Duration::from_secs(12),
-        Duration::from_secs(8),
+        Duration::from_secs(5),
+        Duration::from_secs(4),
     );
 
     // Early cancellation: return as soon as we get a good response (score > 15.0)
@@ -1061,7 +1106,7 @@ pub async fn process_query(
                     best_score = score;
                     best_response = Some(processed);
                 }
-                if best_score > 15.0 && best_response.is_some() {
+                if best_score > 10.0 && best_response.is_some() {
                     break;
                 }
             }
@@ -1418,8 +1463,8 @@ mod tests {
         let result = format_response("this is **bold** text");
         assert!(!result.contains("**bold**"));
         assert!(result.contains("bold"));
-        // ANSI escape inserted
-        assert!(result.contains("\x1b[0;32m"));
+        // Bold text now uses bold+italic+underline+bright green
+        assert!(result.contains("\x1b[1;3;4;92m"));
         assert!(result.contains("\x1b[0m"));
     }
 
