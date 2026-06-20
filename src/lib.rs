@@ -4,13 +4,10 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use colored::*;
-use futures_util::StreamExt;
-use futures_util::stream::FuturesUnordered;
 use regex::Regex;
 use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::pin::Pin;
 use textwrap::wrap;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
@@ -132,14 +129,6 @@ static GROQ_MODELS: &[&str] = &[
     "llama-3.3-70b-versatile",
 ];
 
-static GOOGLE_MODELS: &[&str] = &[];
-
-static NVIDIA_MODELS: &[&str] = &[];
-
-/// Free models available through the local `opencode-to-openai` gateway
-/// (no API key needed when the gateway is running).
-static OPENCODE_GATEWAY_MODELS: &[&str] = &[];
-
 /// Returns the OpenRouter API key from the `OPENROUTER_API_KEY` env var, or an empty string if unset.
 pub fn get_openrouter_key() -> String {
     std::env::var("OPENROUTER_API_KEY").unwrap_or_default()
@@ -154,29 +143,11 @@ pub fn get_models() -> Vec<String> {
     }
 }
 
-/// Returns a Groq-compatible API key: tries GROQ_API_KEY, then OPENROUTER_API_KEY.
+/// Returns a Groq-compatible API key. Only returns the key if GROQ_API_KEY
+/// is explicitly set — does NOT fall back to OpenRouter key (different provider).
 pub fn get_groq_key() -> Result<String, String> {
     std::env::var("GROQ_API_KEY")
-        .map_err(|_| ())
-        .or_else(|_| std::env::var("OPENROUTER_API_KEY").map_err(|_| ()))
-        .map_err(|_| "GROQ_API_KEY or OPENROUTER_API_KEY not set".to_string())
-}
-
-/// Returns the Google Gemini API key from the `GOOGLE_API_KEY` env var, or empty if unset.
-pub fn get_google_key() -> String {
-    std::env::var("GOOGLE_API_KEY").unwrap_or_default()
-}
-
-/// Returns the NVIDIA NIM API key from the `NVIDIA_API_KEY` env var, or empty if unset.
-pub fn get_nvidia_key() -> String {
-    std::env::var("NVIDIA_API_KEY").unwrap_or_default()
-}
-
-/// Returns the base URL of the local `opencode-to-openai` gateway.
-/// Defaults to `http://127.0.0.1:8083`. Override via `OPENCODE_GATEWAY_URL`.
-pub fn get_opencode_gateway_url() -> String {
-    std::env::var("OPENCODE_GATEWAY_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8083".to_string())
+        .map_err(|_| "GROQ_API_KEY not set".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -212,17 +183,38 @@ async fn call_api(
 
     let resp = req
         .json(&body)
-        .timeout(Duration::from_secs(20))
         .send()
         .await
         .map_err(|e| ApiError::Network(e.to_string()))?;
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
-        let detail = http_status_detail(status);
+        // Read response body for actual error details
+        let body_text = resp.text().await.unwrap_or_default();
+        let detail = if body_text.is_empty() {
+            http_status_detail(status).to_string()
+        } else {
+            // Try to extract error message from JSON body
+            serde_json::from_str::<Value>(&body_text)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .or_else(|| v.get("message"))
+                        .and_then(|e| e.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| {
+                    // Fallback: use the raw body if short enough
+                    if body_text.len() < 200 {
+                        body_text
+                    } else {
+                        http_status_detail(status).to_string()
+                    }
+                })
+        };
         return Err(ApiError::Http {
             status,
-            detail: detail.to_string(),
+            detail,
         });
     }
 
@@ -290,81 +282,6 @@ pub async fn call_groq(
 ///
 /// Uses `x-goog-api-key` header instead of Bearer auth – Google API keys
 /// are not accepted as Bearer tokens.
-pub async fn call_google(
-    client: &Client,
-    api_key: &str,
-    model: &str,
-    messages: &[ChatMessage],
-    temperature: f32,
-    max_tokens: u32,
-) -> Result<String, ApiError> {
-    let k = api_key.to_string();
-    call_api(
-        client,
-        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-        move |r| r.header("x-goog-api-key", &k),
-        model,
-        messages,
-        temperature,
-        max_tokens,
-    )
-    .await
-}
-
-/// Calls the NVIDIA NIM API for a single model.
-pub async fn call_nvidia(
-    client: &Client,
-    api_key: &str,
-    model: &str,
-    messages: &[ChatMessage],
-    temperature: f32,
-    max_tokens: u32,
-) -> Result<String, ApiError> {
-    let k = api_key.to_string();
-    call_api(
-        client,
-        "https://integrate.api.nvidia.com/v1/chat/completions",
-        move |r| r.header("Authorization", format!("Bearer {}", k)),
-        model,
-        messages,
-        temperature,
-        max_tokens,
-    )
-    .await
-}
-
-/// Calls the local `opencode-to-openai` gateway (OpenAI-compatible).
-///
-/// No API key is needed by default; if the gateway requires one, set
-/// `OPENCODE_GATEWAY_KEY`.
-pub async fn call_opencode_gateway(
-    client: &Client,
-    model: &str,
-    messages: &[ChatMessage],
-    temperature: f32,
-    max_tokens: u32,
-) -> Result<String, ApiError> {
-    let base = get_opencode_gateway_url();
-    let url = format!("{}/v1/chat/completions", base);
-    let gateway_key = std::env::var("OPENCODE_GATEWAY_KEY").unwrap_or_default();
-    call_api(
-        client,
-        &url,
-        |r| {
-            if gateway_key.is_empty() {
-                r
-            } else {
-                r.header("Authorization", format!("Bearer {}", &gateway_key))
-            }
-        },
-        model,
-        messages,
-        temperature,
-        max_tokens,
-    )
-    .await
-}
-
 // ---------------------------------------------------------------------------
 // Conversation memory (RwLock + VecDeque for O(1) operations)
 // ---------------------------------------------------------------------------
@@ -839,8 +756,6 @@ fn summarize_old_context(messages: &[ChatMessage], keep_recent: usize) -> Vec<Ch
 // Query processing
 // ---------------------------------------------------------------------------
 
-type ModelResult = Result<String, (String, ApiError)>;
-
 /// Cached system prompt — built once, reused on every query.
 fn chat_system_prompt() -> &'static str {
     static PROMPT: LazyLock<String> = LazyLock::new(|| {
@@ -877,161 +792,40 @@ fn chat_system_prompt() -> &'static str {
     &PROMPT
 }
 
-/// Builds a FuturesUnordered containing requests to all configured providers.
-///
-/// Each provider's models are raced in parallel; the caller iterates the stream
-/// to pick the best response or handle tool-call loops.
-fn build_provider_futures(
-    client: &Client,
-    messages: &Arc<Vec<ChatMessage>>,
-    temperature: f32,
-    max_tokens: u32,
-    provider_timeout: Duration,
-    opencode_timeout: Duration,
-) -> FuturesUnordered<Pin<Box<dyn std::future::Future<Output = ModelResult> + Send>>> {
-    let unordered: FuturesUnordered<
-        Pin<Box<dyn std::future::Future<Output = ModelResult> + Send>>,
-    > = FuturesUnordered::new();
-
-    let ak = get_openrouter_key();
-    let gk = get_groq_key();
-    let gk_val = gk.clone().unwrap_or_default();
-    let google_key = get_google_key();
-    let nv_key = get_nvidia_key();
-    let gw_key = std::env::var("OPENCODE_GATEWAY_KEY").unwrap_or_default();
-
-    // Groq first — fastest provider (~200ms), best chance of early exit
-    if !gk_val.is_empty() {
-        for m in GROQ_MODELS {
-            let model = m.to_string();
-            let cl = client.clone();
-            let k = gk_val.clone();
-            let msgs = Arc::clone(messages);
-            unordered.push(Box::pin(async move {
-                let res = timeout(
-                    provider_timeout,
-                    call_groq(&cl, &k, &model, &msgs, temperature, max_tokens),
-                )
-                .await;
-                match res {
-                    Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(e)) => Err((model, e)),
-                    Err(_) => Err((model, ApiError::Timeout)),
-                }
-            }));
-        }
-    }
-
-    // Google Gemini — fast (~300ms)
-    if !google_key.is_empty() {
-        for m in GOOGLE_MODELS {
-            let model = m.to_string();
-            let cl = client.clone();
-            let k = google_key.clone();
-            let msgs = Arc::clone(messages);
-            unordered.push(Box::pin(async move {
-                let res = timeout(
-                    provider_timeout,
-                    call_google(&cl, &k, &model, &msgs, temperature, max_tokens),
-                )
-                .await;
-                match res {
-                    Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(e)) => Err((model, e)),
-                    Err(_) => Err((model, ApiError::Timeout)),
-                }
-            }));
-        }
-    }
-
-    // OpenRouter — slower (~500ms+) but more models
-    if !ak.is_empty() {
-        let models = get_models();
-        for m in models {
-            let model = m;
-            let cl = client.clone();
-            let k = ak.clone();
-            let msgs = Arc::clone(messages);
-            unordered.push(Box::pin(async move {
-                let res = timeout(
-                    provider_timeout,
-                    call_openrouter(&cl, &k, &model, &msgs, temperature, max_tokens),
-                )
-                .await;
-                match res {
-                    Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(e)) => Err((model, e)),
-                    Err(_) => Err((model, ApiError::Timeout)),
-                }
-            }));
-        }
-    }
-
-    // NVIDIA — slower (~1s+)
-    if !nv_key.is_empty() {
-        for m in NVIDIA_MODELS {
-            let model = m.to_string();
-            let cl = client.clone();
-            let k = nv_key.clone();
-            let msgs = Arc::clone(messages);
-            unordered.push(Box::pin(async move {
-                let res = timeout(
-                    provider_timeout,
-                    call_nvidia(&cl, &k, &model, &msgs, temperature, max_tokens),
-                )
-                .await;
-                match res {
-                    Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(e)) => Err((model, e)),
-                    Err(_) => Err((model, ApiError::Timeout)),
-                }
-            }));
-        }
-    }
-
-    // OpenCode gateway — local, variable latency
-    for m in OPENCODE_GATEWAY_MODELS {
-        let model = m.to_string();
-        let cl = client.clone();
-        let msgs = Arc::clone(messages);
-        let gk_clone = gw_key.clone();
-        unordered.push(Box::pin(async move {
-            let base = get_opencode_gateway_url();
-            let url = format!("{}/v1/chat/completions", base);
-            let res = timeout(
-                opencode_timeout,
-                call_api(
-                    &cl,
-                    &url,
-                    |r| {
-                        if gk_clone.is_empty() {
-                            r
-                        } else {
-                            r.header("Authorization", format!("Bearer {}", &gk_clone))
-                        }
-                    },
-                    &model,
-                    &msgs,
-                    temperature,
-                    max_tokens,
-                ),
-            )
-            .await;
-            match res {
-                Ok(Ok(resp)) => Ok(resp),
-                Ok(Err(e)) => Err((model, e)),
-                Err(_) => Err((model, ApiError::Timeout)),
+/// Helper to try a single model call with retry for 429s.
+pub(crate) async fn try_model<F, Fut>(f: F, model: &str, delay_ms: u64) -> (Option<String>, String)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<String, ApiError>>,
+{
+    let mut last_err = String::new();
+    for attempt in 0..2 {
+        let res = timeout(Duration::from_secs(5), f()).await;
+        match res {
+            Ok(Ok(resp)) => {
+                return (Some(resp), String::new());
             }
-        }));
+            Ok(Err(ApiError::Http { status: 429, .. })) => {
+                last_err = format!("{}: Rate limited", model);
+                if attempt == 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+            }
+            Ok(Err(e)) => {
+                last_err = format!("{}: {}", model, e);
+                break;
+            }
+            Err(_) => {
+                last_err = format!("{}: Timeout", model);
+                break;
+            }
+        }
     }
-
-    unordered
+    (None, last_err)
 }
 
-/// Runs a user query against all available models in parallel with best-of-N selection.
-///
-/// Uses Arc for messages (zero-copy sharing), early cancellation when first good response arrives,
-/// and auto-tuned temperature/max_tokens based on query analysis.
+/// Runs a user query against all available models sequentially with scoring and fallback.
 pub async fn process_query(
     client: &Client,
     query: &str,
@@ -1076,39 +870,6 @@ pub async fn process_query(
     let mut response: Option<String> = None;
     let mut attempts: Vec<String> = Vec::new();
 
-    // Helper to try a single model call with retry for 429s
-    async fn try_model<F, Fut>(f: F, model: &str, delay_ms: u64) -> (Option<String>, String)
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<String, ApiError>>,
-    {
-        let mut last_err = String::new();
-        for attempt in 0..2 {
-            let res = tokio::time::timeout(Duration::from_secs(5), f()).await;
-            match res {
-                Ok(Ok(resp)) => {
-                    return (Some(resp), String::new());
-                }
-                Ok(Err(ApiError::Http { status: 429, .. })) => {
-                    last_err = format!("{}: Rate limited", model);
-                    if attempt == 0 {
-                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                        continue;
-                    }
-                }
-                Ok(Err(e)) => {
-                    last_err = format!("{}: {}", model, e);
-                    break;
-                }
-                Err(_) => {
-                    last_err = format!("{}: Timeout", model);
-                    break;
-                }
-            }
-        }
-        (None, last_err)
-    }
-
     // 1. Try Groq first (fastest, ~200ms)
     if response.is_none() && !gk_val.is_empty() {
         for model in GROQ_MODELS {
@@ -1116,7 +877,7 @@ pub async fn process_query(
             let (resp, err) = try_model(
                 || call_groq(client, &gk_val, model, &msgs, effective_temp, max_tokens),
                 model,
-                500,
+                3000,
             )
             .await;
             if let Some(r) = resp {
@@ -1274,42 +1035,61 @@ pub async fn process_code_query(
             break;
         }
 
-        let messages_arc = Arc::new(messages.clone());
+        // Sequential fallback: try one model at a time to avoid rate limiting
+        let ak = get_openrouter_key();
+        let gk = get_groq_key();
+        let gk_val = gk.clone().unwrap_or_default();
 
-        let mut unordered = build_provider_futures(
-            client,
-            &messages_arc,
-            effective_temp,
-            max_tokens,
-            Duration::from_secs(20),
-            Duration::from_secs(15),
-        );
-
-        // Early cancellation: return on first good response (score > 40)
-        let mut best_resp: Option<String> = None;
-        let mut best_score: f64 = -1.0;
+        let mut resp: Option<String> = None;
         let mut attempts: Vec<String> = Vec::new();
 
-        while let Some(result) = unordered.next().await {
-            match result {
-                Ok(resp) => {
-                    let score = score_response(&resp);
-                    if score > best_score {
-                        best_score = score;
-                        best_resp = Some(resp);
-                    }
-                    if best_score > 40.0 {
+        // 1. Groq first (fastest)
+        if resp.is_none() && !gk_val.is_empty() {
+            for model in GROQ_MODELS {
+                let msgs = messages.clone();
+                let (r, err) = try_model(
+                    || call_groq(client, &gk_val, model, &msgs, effective_temp, max_tokens),
+                    model,
+                    3000,
+                )
+                .await;
+                if let Some(result) = r {
+                    let score = score_response(&result);
+                    if score > 0.0 {
+                        resp = Some(result);
                         break;
                     }
-                }
-                Err((model, err)) => {
-                    attempts.push(format!("{}: {}", model, err));
+                    attempts.push(format!("{}: low quality (score {:.0})", model, score));
+                } else {
+                    attempts.push(err);
                 }
             }
         }
-        // Drop remaining futures immediately — don't drain
 
-        let resp = match best_resp {
+        // 2. OpenRouter models one at a time
+        if resp.is_none() && !ak.is_empty() {
+            for model in get_models() {
+                let msgs = messages.clone();
+                let (r, err) = try_model(
+                    || call_openrouter(client, &ak, &model, &msgs, effective_temp, max_tokens),
+                    &model,
+                    5000,
+                )
+                .await;
+                if let Some(result) = r {
+                    let score = score_response(&result);
+                    if score > 0.0 {
+                        resp = Some(result);
+                        break;
+                    }
+                    attempts.push(format!("{}: low quality (score {:.0})", model, score));
+                } else {
+                    attempts.push(err);
+                }
+            }
+        }
+
+        let response = match resp {
             Some(r) => r,
             None => {
                 eprintln!("{}", "[code-agent] All models failed.".red());
@@ -1321,9 +1101,9 @@ pub async fn process_code_query(
         };
 
         // Check for text-based tool call
-        let tool_call = tc_re.captures(&resp).and_then(|caps| {
+        let tool_call = tc_re.captures(&response).and_then(|caps| {
             let tag = caps.get(1)?.as_str();
-            let after_tag = &resp[caps.get(0).unwrap().end()..];
+            let after_tag = &response[caps.get(0).unwrap().end()..];
             let json_str = extract_balanced_json(after_tag)?;
             if tag == "tool_call" {
                 serde_json::from_str::<ToolCallText>(json_str).ok()
@@ -1344,10 +1124,9 @@ pub async fn process_code_query(
                 format!("{} {}", tc.name, summarize_args(&tc.arguments)).yellow()
             );
 
-            messages = Arc::try_unwrap(messages_arc).unwrap_or_else(|arc| (*arc).clone());
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
-                content: Some(resp),
+                content: Some(response.clone()),
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -1361,7 +1140,7 @@ pub async fn process_code_query(
                 tool_call_id: None,
             });
         } else {
-            println!("{}", format_response(&resp));
+            println!("{}", format_response(&response));
             save_conversation().await;
             return;
         }
