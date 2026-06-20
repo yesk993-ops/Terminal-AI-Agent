@@ -865,9 +865,7 @@ pub async fn process_query(
 
     push_conversation(user_msg.clone()).await;
 
-    let start = std::time::Instant::now();
     let raw_history = conversation_history().await;
-    eprintln!("[timing] history load: {:?}", start.elapsed());
     let history = summarize_old_context(&raw_history, 12);
 
     let mut msg_vec = vec![system_msg];
@@ -887,9 +885,7 @@ pub async fn process_query(
     > = FuturesUnordered::new();
 
     if !ak.is_empty() {
-        let models_start = std::time::Instant::now();
         let models = get_models();
-        eprintln!("[timing] get_models ({} models): {:?}", models.len(), models_start.elapsed());
         for m in models {
             let model = m;
             let cl = client.clone();
@@ -911,7 +907,6 @@ pub async fn process_query(
     }
 
     if !gk_val.is_empty() {
-        eprintln!("[timing] queuing {} Groq models", GROQ_MODELS.len());
         for m in GROQ_MODELS {
             let model = m.to_string();
             let cl = client.clone();
@@ -1010,8 +1005,7 @@ pub async fn process_query(
         }));
     }
 
-    let unordered_start = std::time::Instant::now();
-    // Early cancellation: return as soon as we get a good response (score > 40)
+    // Early cancellation: return as soon as we get a good response (score > 15.0)
     // or collect all and pick best
     let mut best_response: Option<String> = None;
     let mut best_score: f64 = 0.0;
@@ -1024,7 +1018,6 @@ pub async fn process_query(
                 let processed = post_process_response(&resp);
                 let score = score_response(&processed);
                 all_responses.push((processed.clone(), score));
-                eprintln!("[timing] response arrived at {:?} (score={:.1})", unordered_start.elapsed(), score);
 
                 if score > best_score {
                     best_score = score;
@@ -1032,7 +1025,6 @@ pub async fn process_query(
                 }
                 // Early exit if we got a good enough response
                 if best_score > 15.0 && best_response.is_some() {
-                    eprintln!("[timing] early exit at {:?} with score {:.1}", unordered_start.elapsed(), best_score);
                     break;
                 }
             }
@@ -1044,7 +1036,6 @@ pub async fn process_query(
 
     // If we broke early, don't drain - just drop the remaining futures
     // to avoid blocking on slow/timeout models
-    eprintln!("[timing] total model query time: {:?}", unordered_start.elapsed());
 
     if let Some(best) = best_response {
         let assistant = ChatMessage {
@@ -1054,9 +1045,7 @@ pub async fn process_query(
             tool_call_id: None,
         };
         push_conversation(assistant).await;
-        let save_start = std::time::Instant::now();
         save_conversation().await;
-        eprintln!("[timing] save conversation: {:?}", save_start.elapsed());
         println!("{}", format_response(&best));
         return;
     }
