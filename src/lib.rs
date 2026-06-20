@@ -123,20 +123,11 @@ struct ChatResponse {
 static FREE_MODELS: &[&str] = &[
     "deepseek/deepseek-chat-v3-0324:free",
     "google/gemini-2.0-flash-exp:free",
-    "nvidia/nemotron-3-super:free",
-    "meta-llama/llama-4-maverick:free",
     "qwen/qwen3-235b-a22b:free",
-    "mistralai/mistral-small-3.1-24b-instruct:free",
-    "microsoft/phi-4-reasoning:free",
-    "openrouter/owl-alpha",
-    "google/gemma-4-31b-it:free",
-    "nvidia/nemotron-nano-12b-v2-vl:free",
 ];
 
 static GROQ_MODELS: &[&str] = &[
     "llama-3.3-70b-versatile",
-    "mixtral-8x7b-32768",
-    "llama-3.1-8b-instant",
 ];
 
 static GOOGLE_MODELS: &[&str] = &[
@@ -874,7 +865,9 @@ pub async fn process_query(
 
     push_conversation(user_msg.clone()).await;
 
+    let start = std::time::Instant::now();
     let raw_history = conversation_history().await;
+    eprintln!("[timing] history load: {:?}", start.elapsed());
     let history = summarize_old_context(&raw_history, 12);
 
     let mut msg_vec = vec![system_msg];
@@ -894,7 +887,10 @@ pub async fn process_query(
     > = FuturesUnordered::new();
 
     if !ak.is_empty() {
-        for m in get_models() {
+        let models_start = std::time::Instant::now();
+        let models = get_models();
+        eprintln!("[timing] get_models ({} models): {:?}", models.len(), models_start.elapsed());
+        for m in models {
             let model = m;
             let cl = client.clone();
             let k = ak.clone();
@@ -915,6 +911,7 @@ pub async fn process_query(
     }
 
     if !gk_val.is_empty() {
+        eprintln!("[timing] queuing {} Groq models", GROQ_MODELS.len());
         for m in GROQ_MODELS {
             let model = m.to_string();
             let cl = client.clone();
@@ -1013,6 +1010,7 @@ pub async fn process_query(
         }));
     }
 
+    let unordered_start = std::time::Instant::now();
     // Early cancellation: return as soon as we get a good response (score > 40)
     // or collect all and pick best
     let mut best_response: Option<String> = None;
@@ -1026,13 +1024,15 @@ pub async fn process_query(
                 let processed = post_process_response(&resp);
                 let score = score_response(&processed);
                 all_responses.push((processed.clone(), score));
+                eprintln!("[timing] response arrived at {:?} (score={:.1})", unordered_start.elapsed(), score);
 
                 if score > best_score {
                     best_score = score;
                     best_response = Some(processed);
                 }
                 // Early exit if we got a good enough response
-                if best_score > 40.0 && best_response.is_some() {
+                if best_score > 15.0 && best_response.is_some() {
+                    eprintln!("[timing] early exit at {:?} with score {:.1}", unordered_start.elapsed(), best_score);
                     break;
                 }
             }
@@ -1042,10 +1042,9 @@ pub async fn process_query(
         }
     }
 
-    // If we broke early, drain remaining futures to avoid dropping them mid-flight
-    if best_response.is_some() {
-        while let Some(_) = unordered.next().await {}
-    }
+    // If we broke early, don't drain - just drop the remaining futures
+    // to avoid blocking on slow/timeout models
+    eprintln!("[timing] total model query time: {:?}", unordered_start.elapsed());
 
     if let Some(best) = best_response {
         let assistant = ChatMessage {
@@ -1055,7 +1054,9 @@ pub async fn process_query(
             tool_call_id: None,
         };
         push_conversation(assistant).await;
+        let save_start = std::time::Instant::now();
         save_conversation().await;
+        eprintln!("[timing] save conversation: {:?}", save_start.elapsed());
         println!("{}", format_response(&best));
         return;
     }
