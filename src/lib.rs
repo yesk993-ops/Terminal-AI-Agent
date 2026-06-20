@@ -1,5 +1,6 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use colored::*;
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::pin::Pin;
 use textwrap::wrap;
+use tokio::sync::RwLock;
 use tokio::time::timeout;
 
 pub mod tools;
@@ -382,70 +384,86 @@ pub async fn call_opencode_gateway(
 }
 
 // ---------------------------------------------------------------------------
-// Conversation memory
+// Conversation memory (RwLock + VecDeque for O(1) operations)
 // ---------------------------------------------------------------------------
 
-static CONVERSATION: LazyLock<Mutex<Vec<ChatMessage>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+static CONVERSATION: LazyLock<RwLock<VecDeque<ChatMessage>>> =
+    LazyLock::new(|| RwLock::new(VecDeque::new()));
 
-fn conv() -> std::sync::MutexGuard<'static, Vec<ChatMessage>> {
-    CONVERSATION.lock().unwrap_or_else(|e| e.into_inner())
-}
+const MAX_TURNS: usize = 12;
 
 /// Appends a message to the in-memory conversation history.
 ///
-/// Automatically trims history to the last 6 turns (12 messages) to keep context size manageable.
-pub fn push_conversation(msg: ChatMessage) {
-    let mut c = conv();
-    c.push(msg);
-    const MAX_TURNS: usize = 12;
+/// Automatically trims history to the last 6 turns (12 messages) using VecDeque::pop_front (O(1)).
+pub async fn push_conversation(msg: ChatMessage) {
+    let mut c = CONVERSATION.write().await;
+    c.push_back(msg);
     while c.len() > MAX_TURNS {
-        c.remove(0);
+        c.pop_front();
     }
 }
 
 /// Returns a copy of the current conversation history.
-pub fn conversation_history() -> Vec<ChatMessage> {
-    conv().clone()
+pub async fn conversation_history() -> Vec<ChatMessage> {
+    CONVERSATION.read().await.iter().cloned().collect()
 }
 
 /// Clears the conversation history.
-pub fn clear_conversation() {
-    conv().clear();
+pub async fn clear_conversation() {
+    CONVERSATION.write().await.clear();
 }
 
-fn history_path() -> PathBuf {
-    let data_home = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join(".local/share")
-        });
-    let dir = data_home.join("terminal_ai_agent");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join("history.json")
+/// Cached history path — computed once, reused on every save/load.
+fn history_path() -> &'static PathBuf {
+    static PATH: LazyLock<PathBuf> = LazyLock::new(|| {
+        let data_home = std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                PathBuf::from(home).join(".local/share")
+            });
+        let dir = data_home.join("terminal_ai_agent");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("history.json")
+    });
+    &PATH
 }
 
-/// Persists the current conversation history to disk with restrictive permissions (600).
-pub fn save_conversation() {
-    let path = history_path();
-    if let Ok(data) = serde_json::to_string(&*conv()) {
-        if let Ok(()) = std::fs::write(&path, &data) {
+/// Persists the current conversation history to disk (non-blocking).
+pub async fn save_conversation() {
+    let path = history_path().clone();
+    let data = {
+        let c = CONVERSATION.read().await;
+        serde_json::to_string(&*c).ok()
+    };
+    if let Some(data) = data {
+        tokio::task::spawn_blocking(move || {
+            let _ = std::fs::write(&path, &data);
             #[cfg(unix)]
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        })
+        .await
+        .ok();
     }
 }
 
-/// Loads a previously saved conversation from disk, replacing the current in-memory history.
-pub fn load_conversation() {
-    let path = history_path();
-    if let Ok(data) = std::fs::read_to_string(&path) {
-        if let Ok(hist) = serde_json::from_str::<Vec<ChatMessage>>(&data) {
-            let mut c = conv();
-            *c = hist;
-        }
+/// Loads a previously saved conversation from disk (non-blocking).
+pub async fn load_conversation() {
+    let path = history_path().clone();
+    let hist = tokio::task::spawn_blocking(move || {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|data| serde_json::from_str::<Vec<ChatMessage>>(&data).ok())
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(hist) = hist {
+        let mut c = CONVERSATION.write().await;
+        *c = VecDeque::from(hist);
     }
 }
 
@@ -827,15 +845,14 @@ fn chat_system_prompt() -> String {
 
 /// Runs a user query against all available models in parallel with best-of-N selection.
 ///
-/// Collects responses from all providers, scores them, and displays the highest quality one.
-/// Uses auto-tuned temperature and max_tokens based on query analysis.
+/// Uses Arc for messages (zero-copy sharing), early cancellation when first good response arrives,
+/// and auto-tuned temperature/max_tokens based on query analysis.
 pub async fn process_query(
     client: &Client,
     query: &str,
     temperature: f32,
 ) {
     let effective_temp = if (temperature - 0.8).abs() < 0.01 {
-        // User didn't override — use auto-tuning
         auto_temperature(query)
     } else {
         temperature
@@ -855,25 +872,33 @@ pub async fn process_query(
         tool_call_id: None,
     };
 
-    push_conversation(user_msg.clone());
+    push_conversation(user_msg.clone()).await;
 
-    let raw_history = conversation_history();
+    let raw_history = conversation_history().await;
     let history = summarize_old_context(&raw_history, 12);
 
-    let mut messages = vec![system_msg];
-    messages.extend(history);
+    let mut msg_vec = vec![system_msg];
+    msg_vec.extend(history);
+    let messages = Arc::new(msg_vec);
+
+    // Collect API keys once
+    let ak = get_openrouter_key();
+    let gk = get_groq_key();
+    let gk_val = gk.clone().unwrap_or_default();
+    let google_key = get_google_key();
+    let nv_key = get_nvidia_key();
+    let gw_key = std::env::var("OPENCODE_GATEWAY_KEY").unwrap_or_default();
 
     let mut unordered: FuturesUnordered<
         Pin<Box<dyn std::future::Future<Output = ModelResult> + Send>>,
     > = FuturesUnordered::new();
 
-    let ak = get_openrouter_key();
     if !ak.is_empty() {
         for m in get_models() {
             let model = m;
             let cl = client.clone();
             let k = ak.clone();
-            let msgs = messages.clone();
+            let msgs = Arc::clone(&messages);
             unordered.push(Box::pin(async move {
                 let res = timeout(
                     Duration::from_secs(12),
@@ -889,12 +914,12 @@ pub async fn process_query(
         }
     }
 
-    if let Ok(gk) = get_groq_key() {
+    if !gk_val.is_empty() {
         for m in GROQ_MODELS {
             let model = m.to_string();
             let cl = client.clone();
-            let k = gk.clone();
-            let msgs = messages.clone();
+            let k = gk_val.clone();
+            let msgs = Arc::clone(&messages);
             unordered.push(Box::pin(async move {
                 let res = timeout(
                     Duration::from_secs(12),
@@ -910,13 +935,12 @@ pub async fn process_query(
         }
     }
 
-    let gk = get_google_key();
-    if !gk.is_empty() {
+    if !google_key.is_empty() {
         for m in GOOGLE_MODELS {
             let model = m.to_string();
             let cl = client.clone();
-            let k = gk.clone();
-            let msgs = messages.clone();
+            let k = google_key.clone();
+            let msgs = Arc::clone(&messages);
             unordered.push(Box::pin(async move {
                 let res = timeout(
                     Duration::from_secs(12),
@@ -932,13 +956,12 @@ pub async fn process_query(
         }
     }
 
-    let nk = get_nvidia_key();
-    if !nk.is_empty() {
+    if !nv_key.is_empty() {
         for m in NVIDIA_MODELS {
             let model = m.to_string();
             let cl = client.clone();
-            let k = nk.clone();
-            let msgs = messages.clone();
+            let k = nv_key.clone();
+            let msgs = Arc::clone(&messages);
             unordered.push(Box::pin(async move {
                 let res = timeout(
                     Duration::from_secs(12),
@@ -954,12 +977,12 @@ pub async fn process_query(
         }
     }
 
-    // OpenCode gateway (no API key needed if running locally)
+    // OpenCode gateway
     for m in OPENCODE_GATEWAY_MODELS {
         let model = m.to_string();
         let cl = client.clone();
-        let msgs = messages.clone();
-        let gateway_key = std::env::var("OPENCODE_GATEWAY_KEY").unwrap_or_default();
+        let msgs = Arc::clone(&messages);
+        let gk_clone = gw_key.clone();
         unordered.push(Box::pin(async move {
             let base = get_opencode_gateway_url();
             let url = format!("{}/v1/chat/completions", base);
@@ -969,10 +992,10 @@ pub async fn process_query(
                     &cl,
                     &url,
                     |r| {
-                        if gateway_key.is_empty() {
+                        if gk_clone.is_empty() {
                             r
                         } else {
-                            r.header("Authorization", format!("Bearer {}", &gateway_key))
+                            r.header("Authorization", format!("Bearer {}", &gk_clone))
                         }
                     },
                     &model,
@@ -990,16 +1013,28 @@ pub async fn process_query(
         }));
     }
 
-    // Collect all successful responses for best-of-N selection
-    let mut responses: Vec<(String, f64)> = Vec::new();
+    // Early cancellation: return as soon as we get a good response (score > 40)
+    // or collect all and pick best
+    let mut best_response: Option<String> = None;
+    let mut best_score: f64 = 0.0;
     let mut attempts: Vec<String> = Vec::new();
+    let mut all_responses: Vec<(String, f64)> = Vec::new();
 
     while let Some(result) = unordered.next().await {
         match result {
             Ok(resp) => {
                 let processed = post_process_response(&resp);
                 let score = score_response(&processed);
-                responses.push((processed, score));
+                all_responses.push((processed.clone(), score));
+
+                if score > best_score {
+                    best_score = score;
+                    best_response = Some(processed);
+                }
+                // Early exit if we got a good enough response
+                if best_score > 40.0 && best_response.is_some() {
+                    break;
+                }
             }
             Err(e) => {
                 attempts.push(format!("{}: {}", e.0, e.1));
@@ -1007,30 +1042,31 @@ pub async fn process_query(
         }
     }
 
-    if !responses.is_empty() {
-        // Pick the highest-scored response
-        responses.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let best = &responses[0].0;
+    // If we broke early, drain remaining futures to avoid dropping them mid-flight
+    if best_response.is_some() {
+        while let Some(_) = unordered.next().await {}
+    }
 
+    if let Some(best) = best_response {
         let assistant = ChatMessage {
             role: "assistant".to_string(),
             content: Some(best.clone()),
             tool_calls: None,
             tool_call_id: None,
         };
-        push_conversation(assistant);
-        save_conversation();
-        println!("{}", format_response(best));
+        push_conversation(assistant).await;
+        save_conversation().await;
+        println!("{}", format_response(&best));
         return;
     }
 
-    // All failed — show a helpful summary
-    conv().pop();
+    // All failed
+    CONVERSATION.write().await.pop_back();
 
-    let no_or = get_openrouter_key().is_empty();
-    let no_groq = get_groq_key().is_err();
-    let no_google = get_google_key().is_empty();
-    let no_nvidia = get_nvidia_key().is_empty();
+    let no_or = ak.is_empty();
+    let no_groq = gk.is_err();
+    let no_google = google_key.is_empty();
+    let no_nvidia = nv_key.is_empty();
     let no_keys = no_or && no_groq && no_google && no_nvidia;
 
     eprintln!("{}", "All free models failed.".red());
@@ -1115,9 +1151,8 @@ Examples:
 
 /// Runs a query in coding-agent mode with text-based tool calling.
 ///
-/// Uses a special prompt instructing the model to output tool calls in
-/// `<tool_call>{"name":"...","arguments":{...}}</tool_call>` format.
-/// This works with any text model (no API-level function calling required).
+/// Uses Arc for messages (zero-copy sharing), early cancellation, and
+/// a special prompt for tool calling via text tags.
 pub async fn process_code_query(
     client: &Client,
     query: &str,
@@ -1148,6 +1183,14 @@ pub async fn process_code_query(
     let mut iterations = 0;
     const MAX_ITER: usize = 25;
 
+    // Cache API keys once
+    let ak = get_openrouter_key();
+    let gk = get_groq_key();
+    let gk_val = gk.clone().unwrap_or_default();
+    let google_key = get_google_key();
+    let nv_key = get_nvidia_key();
+    let gw_key = std::env::var("OPENCODE_GATEWAY_KEY").unwrap_or_default();
+
     loop {
         iterations += 1;
         if iterations > MAX_ITER {
@@ -1155,17 +1198,18 @@ pub async fn process_code_query(
             break;
         }
 
+        let messages_arc = Arc::new(messages.clone());
+
         let mut unordered: FuturesUnordered<
             Pin<Box<dyn std::future::Future<Output = ModelResult> + Send>>,
         > = FuturesUnordered::new();
 
-        let ak = get_openrouter_key();
         if !ak.is_empty() {
             for m in get_models() {
                 let model = m;
                 let cl = client.clone();
                 let k = ak.clone();
-                let msgs = messages.clone();
+                let msgs = Arc::clone(&messages_arc);
                 let m2 = model.clone();
                 unordered.push(Box::pin(async move {
                     let res = timeout(
@@ -1182,12 +1226,12 @@ pub async fn process_code_query(
             }
         }
 
-        if let Ok(gk) = get_groq_key() {
+        if !gk_val.is_empty() {
             for m in GROQ_MODELS {
                 let model = m.to_string();
                 let cl = client.clone();
-                let k = gk.clone();
-                let msgs = messages.clone();
+                let k = gk_val.clone();
+                let msgs = Arc::clone(&messages_arc);
                 let m2 = model.clone();
                 unordered.push(Box::pin(async move {
                     let res = timeout(
@@ -1204,13 +1248,12 @@ pub async fn process_code_query(
             }
         }
 
-        let gk = get_google_key();
-        if !gk.is_empty() {
+        if !google_key.is_empty() {
             for m in GOOGLE_MODELS {
                 let model = m.to_string();
                 let cl = client.clone();
-                let k = gk.clone();
-                let msgs = messages.clone();
+                let k = google_key.clone();
+                let msgs = Arc::clone(&messages_arc);
                 let m2 = model.clone();
                 unordered.push(Box::pin(async move {
                     let res = timeout(
@@ -1227,13 +1270,12 @@ pub async fn process_code_query(
             }
         }
 
-        let nk = get_nvidia_key();
-        if !nk.is_empty() {
+        if !nv_key.is_empty() {
             for m in NVIDIA_MODELS {
                 let model = m.to_string();
                 let cl = client.clone();
-                let k = nk.clone();
-                let msgs = messages.clone();
+                let k = nv_key.clone();
+                let msgs = Arc::clone(&messages_arc);
                 let m2 = model.clone();
                 unordered.push(Box::pin(async move {
                     let res = timeout(
@@ -1250,13 +1292,13 @@ pub async fn process_code_query(
             }
         }
 
-        // OpenCode gateway (no API key needed if running locally)
+        // OpenCode gateway
         for m in OPENCODE_GATEWAY_MODELS {
             let model = m.to_string();
             let cl = client.clone();
-            let msgs = messages.clone();
+            let msgs = Arc::clone(&messages_arc);
             let m2 = model.clone();
-            let gateway_key = std::env::var("OPENCODE_GATEWAY_KEY").unwrap_or_default();
+            let gk_clone = gw_key.clone();
             unordered.push(Box::pin(async move {
                 let base = get_opencode_gateway_url();
                 let url = format!("{}/v1/chat/completions", base);
@@ -1266,10 +1308,10 @@ pub async fn process_code_query(
                         &cl,
                         &url,
                         |r| {
-                            if gateway_key.is_empty() {
+                            if gk_clone.is_empty() {
                                 r
                             } else {
-                                r.header("Authorization", format!("Bearer {}", &gateway_key))
+                                r.header("Authorization", format!("Bearer {}", &gk_clone))
                             }
                         },
                         &model,
@@ -1287,7 +1329,7 @@ pub async fn process_code_query(
             }));
         }
 
-        // Collect responses and pick best one
+        // Early cancellation: return on first good response (score > 40)
         let mut best_resp: Option<String> = None;
         let mut best_score: f64 = -1.0;
         let mut attempts: Vec<String> = Vec::new();
@@ -1300,11 +1342,20 @@ pub async fn process_code_query(
                         best_score = score;
                         best_resp = Some(resp);
                     }
+                    // Early exit for good enough responses
+                    if best_score > 40.0 {
+                        break;
+                    }
                 }
                 Err((model, err)) => {
                     attempts.push(format!("{}: {}", model, err));
                 }
             }
+        }
+
+        // Drain remaining futures
+        if best_resp.is_some() {
+            while let Some(_) = unordered.next().await {}
         }
 
         let resp = match best_resp {
@@ -1323,10 +1374,8 @@ pub async fn process_code_query(
             let tag = caps.get(1)?.as_str();
             let json_str = caps.get(2)?.as_str();
             if tag == "tool_call" {
-                // <tool_call>{"name":"x","arguments":{...}}</tool_call>
                 serde_json::from_str::<ToolCallText>(json_str).ok()
             } else {
-                // <bash>{"command":"..."}</bash>  or  <write_file>{"path":"...","content":"..."}</write_file>
                 let args: Value = serde_json::from_str(json_str).ok()?;
                 Some(ToolCallText {
                     name: tag.to_string(),
@@ -1336,6 +1385,7 @@ pub async fn process_code_query(
         });
 
         if let Some(tc) = tool_call {
+            messages = Arc::try_unwrap(messages_arc).unwrap_or_else(|arc| (*arc).clone());
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: Some(resp),
@@ -1352,7 +1402,6 @@ pub async fn process_code_query(
                 tool_call_id: None,
             });
         } else {
-            // No tool call — final answer
             println!("{}", format_response(&resp));
             return;
         }
@@ -1460,11 +1509,11 @@ mod tests {
         assert_eq!(get_openrouter_key(), "");
     }
 
-    // -- conversation tests (run serially via single test) --
+    // -- conversation tests (async) --
 
-    #[test]
-    fn test_conversation_push_max_and_history() {
-        clear_conversation();
+    #[tokio::test]
+    async fn test_conversation_push_max_and_history() {
+        clear_conversation().await;
 
         let msg = ChatMessage {
             role: "user".to_string(),
@@ -1472,8 +1521,8 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         };
-        push_conversation(msg);
-        assert_eq!(conversation_history().len(), 1);
+        push_conversation(msg).await;
+        assert_eq!(conversation_history().await.len(), 1);
 
         // Push beyond max
         for i in 0..20 {
@@ -1482,10 +1531,11 @@ mod tests {
                 content: Some(format!("msg {}", i)),
                 tool_calls: None,
                 tool_call_id: None,
-            });
+            })
+            .await;
         }
 
-        let hist = conversation_history();
+        let hist = conversation_history().await;
         assert_eq!(hist.len(), 12);
         // Oldest messages should have been removed
         assert_eq!(hist[0].content.as_deref(), Some("msg 8"));

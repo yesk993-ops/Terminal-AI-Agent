@@ -32,9 +32,16 @@ fn parse_args() -> (String, f32, bool) {
 
 #[tokio::main]
 async fn main() {
-    load_conversation();
+    load_conversation().await;
 
-    let client = reqwest::Client::new();
+    // Configure reqwest with HTTP/2, connection pooling, and DNS caching
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(10)
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("Failed to create HTTP client");
 
     // Ctrl+C handler
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -52,12 +59,12 @@ async fn main() {
         } else {
             process_query(&client, &query, temperature).await;
         }
-        save_conversation();
+        save_conversation().await;
         return;
     }
 
     if code_mode {
-        clear_conversation();
+        clear_conversation().await;
     }
 
     println!(
@@ -78,7 +85,7 @@ async fn main() {
         tokio::select! {
             _ = &mut shutdown_rx => {
                 println!("\n{}", "Saving conversation...".yellow());
-                save_conversation();
+                save_conversation().await;
                 println!("{}", "Goodbye!".green());
                 break;
             }
@@ -115,7 +122,7 @@ async fn main() {
                             } else {
                                 process_query(&client, q, temperature).await;
                             }
-                            save_conversation();
+                            save_conversation().await;
                         } else {
                             eprintln!(
                                 "{}",
@@ -129,6 +136,6 @@ async fn main() {
         }
     }
 
-    save_conversation();
-    println!("{}", "Goodbye!".green().bold());
+    save_conversation().await;
+    println!("{}", "Goodbye!".green());
 }

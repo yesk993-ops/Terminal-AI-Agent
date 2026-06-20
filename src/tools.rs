@@ -1,7 +1,6 @@
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Command as StdCommand;
-use std::time::Duration;
 
 pub fn all_tool_defs() -> Vec<Value> {
     vec![
@@ -157,8 +156,8 @@ pub async fn execute_tool(name: &str, args: &Value) -> String {
         "write_file" => exec_write_file(args),
         "edit_file" => exec_edit_file(args),
         "bash" => exec_bash(args).await,
-        "grep" => exec_grep(args),
-        "glob" => exec_glob(args),
+        "grep" => exec_grep(args).await,
+        "glob" => exec_glob(args).await,
         "list_dir" => exec_list_dir(args),
         _ => format!("Unknown tool: {}", name),
     }
@@ -235,10 +234,12 @@ async fn exec_bash(args: &Value) -> String {
         Some(c) => c,
         None => return "Missing argument: command".to_string(),
     };
-    let output = tokio::time::timeout(Duration::from_secs(30), async {
+    let cmd = cmd.to_string();
+
+    let output = tokio::task::spawn_blocking(move || {
         StdCommand::new("sh")
             .arg("-c")
-            .arg(cmd)
+            .arg(&cmd)
             .output()
     })
     .await;
@@ -266,11 +267,11 @@ async fn exec_bash(args: &Value) -> String {
             result
         }
         Ok(Err(e)) => format!("Command error: {}", e),
-        Err(_) => "Command timed out after 30s".to_string(),
+        Err(_) => "Failed to spawn command".to_string(),
     }
 }
 
-fn exec_grep(args: &Value) -> String {
+async fn exec_grep(args: &Value) -> String {
     let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => return "Missing argument: pattern".to_string(),
@@ -278,24 +279,25 @@ fn exec_grep(args: &Value) -> String {
     let path = args
         .get("path")
         .and_then(|v| v.as_str())
-        .unwrap_or(".");
-    let include = args.get("include").and_then(|v| v.as_str());
+        .unwrap_or(".")
+        .to_string();
+    let include = args.get("include").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    let mut cmd = StdCommand::new("rg");
-    cmd.arg("-n");
-    if let Some(inc) = include {
-        cmd.arg("--glob");
-        cmd.arg(inc);
-    }
-    cmd.arg(pattern);
-    cmd.arg(path);
-
-    let max_results = 50;
-    cmd.arg("-m");
-    cmd.arg(max_results.to_string());
-
-    match cmd.output() {
-        Ok(out) => {
+    let pattern = pattern.to_string();
+    match tokio::task::spawn_blocking(move || {
+        let mut cmd = StdCommand::new("rg");
+        cmd.arg("-n");
+        if let Some(ref inc) = include {
+            cmd.arg("--glob");
+            cmd.arg(inc);
+        }
+        cmd.arg(&pattern);
+        cmd.arg(&path);
+        cmd.arg("-m").arg("50");
+        cmd.output()
+    })
+    .await {
+        Ok(Ok(out)) => {
             let mut result = String::new();
             if !out.stdout.is_empty() {
                 result.push_str(&String::from_utf8_lossy(&out.stdout));
@@ -315,11 +317,11 @@ fn exec_grep(args: &Value) -> String {
             }
             result
         }
-        Err(e) => format!("grep error: {} (is ripgrep installed?)", e),
+        _ => "grep error: failed to spawn (is ripgrep installed?)".to_string(),
     }
 }
 
-fn exec_glob(args: &Value) -> String {
+async fn exec_glob(args: &Value) -> String {
     let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => return "Missing argument: pattern".to_string(),
@@ -327,26 +329,30 @@ fn exec_glob(args: &Value) -> String {
     let path = args
         .get("path")
         .and_then(|v| v.as_str())
-        .unwrap_or(".");
+        .unwrap_or(".")
+        .to_string();
+    let pattern = pattern.to_string();
 
-    let mut cmd = StdCommand::new("find");
-    cmd.arg(path);
-    if let Some(dir) = Path::new(pattern).parent() {
-        if !dir.to_string_lossy().is_empty() {
-            cmd.arg("-path");
-            cmd.arg(format!("*/{}", dir.to_string_lossy()));
-            cmd.arg("-prune");
-            cmd.arg("-o");
+    match tokio::task::spawn_blocking(move || {
+        let mut cmd = StdCommand::new("find");
+        cmd.arg(&path);
+        if let Some(dir) = Path::new(&pattern).parent() {
+            if !dir.to_string_lossy().is_empty() {
+                cmd.arg("-path");
+                cmd.arg(format!("*/{}", dir.to_string_lossy()));
+                cmd.arg("-prune");
+                cmd.arg("-o");
+            }
         }
-    }
-    cmd.arg("-name");
-    cmd.arg(Path::new(pattern)
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_else(|| pattern.to_string()));
-
-    match cmd.output() {
-        Ok(out) => {
+        cmd.arg("-name");
+        cmd.arg(Path::new(&pattern)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| pattern.to_string()));
+        cmd.output()
+    })
+    .await {
+        Ok(Ok(out)) => {
             let result = String::from_utf8_lossy(&out.stdout).to_string();
             if result.is_empty() {
                 "(no matches)".to_string()
@@ -360,7 +366,7 @@ fn exec_glob(args: &Value) -> String {
                 }
             }
         }
-        Err(e) => format!("find error: {}", e),
+        _ => "find error: failed to spawn".to_string(),
     }
 }
 
