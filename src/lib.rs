@@ -834,6 +834,153 @@ fn chat_system_prompt() -> String {
         .to_string()
 }
 
+/// Builds a FuturesUnordered containing requests to all configured providers.
+///
+/// Each provider's models are raced in parallel; the caller iterates the stream
+/// to pick the best response or handle tool-call loops.
+fn build_provider_futures(
+    client: &Client,
+    messages: &Arc<Vec<ChatMessage>>,
+    temperature: f32,
+    max_tokens: u32,
+    provider_timeout: Duration,
+    opencode_timeout: Duration,
+) -> FuturesUnordered<Pin<Box<dyn std::future::Future<Output = ModelResult> + Send>>> {
+    let unordered: FuturesUnordered<
+        Pin<Box<dyn std::future::Future<Output = ModelResult> + Send>>,
+    > = FuturesUnordered::new();
+
+    let ak = get_openrouter_key();
+    let gk = get_groq_key();
+    let gk_val = gk.clone().unwrap_or_default();
+    let google_key = get_google_key();
+    let nv_key = get_nvidia_key();
+    let gw_key = std::env::var("OPENCODE_GATEWAY_KEY").unwrap_or_default();
+
+    if !ak.is_empty() {
+        let models = get_models();
+        for m in models {
+            let model = m;
+            let cl = client.clone();
+            let k = ak.clone();
+            let msgs = Arc::clone(messages);
+            unordered.push(Box::pin(async move {
+                let res = timeout(
+                    provider_timeout,
+                    call_openrouter(&cl, &k, &model, &msgs, temperature, max_tokens),
+                )
+                .await;
+                match res {
+                    Ok(Ok(resp)) => Ok(resp),
+                    Ok(Err(e)) => Err((model, e)),
+                    Err(_) => Err((model, ApiError::Timeout)),
+                }
+            }));
+        }
+    }
+
+    if !gk_val.is_empty() {
+        for m in GROQ_MODELS {
+            let model = m.to_string();
+            let cl = client.clone();
+            let k = gk_val.clone();
+            let msgs = Arc::clone(messages);
+            unordered.push(Box::pin(async move {
+                let res = timeout(
+                    provider_timeout,
+                    call_groq(&cl, &k, &model, &msgs, temperature, max_tokens),
+                )
+                .await;
+                match res {
+                    Ok(Ok(resp)) => Ok(resp),
+                    Ok(Err(e)) => Err((model, e)),
+                    Err(_) => Err((model, ApiError::Timeout)),
+                }
+            }));
+        }
+    }
+
+    if !google_key.is_empty() {
+        for m in GOOGLE_MODELS {
+            let model = m.to_string();
+            let cl = client.clone();
+            let k = google_key.clone();
+            let msgs = Arc::clone(messages);
+            unordered.push(Box::pin(async move {
+                let res = timeout(
+                    provider_timeout,
+                    call_google(&cl, &k, &model, &msgs, temperature, max_tokens),
+                )
+                .await;
+                match res {
+                    Ok(Ok(resp)) => Ok(resp),
+                    Ok(Err(e)) => Err((model, e)),
+                    Err(_) => Err((model, ApiError::Timeout)),
+                }
+            }));
+        }
+    }
+
+    if !nv_key.is_empty() {
+        for m in NVIDIA_MODELS {
+            let model = m.to_string();
+            let cl = client.clone();
+            let k = nv_key.clone();
+            let msgs = Arc::clone(messages);
+            unordered.push(Box::pin(async move {
+                let res = timeout(
+                    provider_timeout,
+                    call_nvidia(&cl, &k, &model, &msgs, temperature, max_tokens),
+                )
+                .await;
+                match res {
+                    Ok(Ok(resp)) => Ok(resp),
+                    Ok(Err(e)) => Err((model, e)),
+                    Err(_) => Err((model, ApiError::Timeout)),
+                }
+            }));
+        }
+    }
+
+    // OpenCode gateway
+    for m in OPENCODE_GATEWAY_MODELS {
+        let model = m.to_string();
+        let cl = client.clone();
+        let msgs = Arc::clone(messages);
+        let gk_clone = gw_key.clone();
+        unordered.push(Box::pin(async move {
+            let base = get_opencode_gateway_url();
+            let url = format!("{}/v1/chat/completions", base);
+            let res = timeout(
+                opencode_timeout,
+                call_api(
+                    &cl,
+                    &url,
+                    |r| {
+                        if gk_clone.is_empty() {
+                            r
+                        } else {
+                            r.header("Authorization", format!("Bearer {}", &gk_clone))
+                        }
+                    },
+                    &model,
+                    &msgs,
+                    temperature,
+                    max_tokens,
+                ),
+            )
+            .await;
+            match res {
+                Ok(Ok(resp)) => Ok(resp),
+                Ok(Err(e)) => Err((model, e)),
+                Err(_) => Err((model, ApiError::Timeout)),
+            }
+        }));
+    }
+
+    unordered
+}
+
 /// Runs a user query against all available models in parallel with best-of-N selection.
 ///
 /// Uses Arc for messages (zero-copy sharing), early cancellation when first good response arrives,
@@ -875,135 +1022,17 @@ pub async fn process_query(
     // Collect API keys once
     let ak = get_openrouter_key();
     let gk = get_groq_key();
-    let gk_val = gk.clone().unwrap_or_default();
     let google_key = get_google_key();
     let nv_key = get_nvidia_key();
-    let gw_key = std::env::var("OPENCODE_GATEWAY_KEY").unwrap_or_default();
 
-    let mut unordered: FuturesUnordered<
-        Pin<Box<dyn std::future::Future<Output = ModelResult> + Send>>,
-    > = FuturesUnordered::new();
-
-    if !ak.is_empty() {
-        let models = get_models();
-        for m in models {
-            let model = m;
-            let cl = client.clone();
-            let k = ak.clone();
-            let msgs = Arc::clone(&messages);
-            unordered.push(Box::pin(async move {
-                let res = timeout(
-                    Duration::from_secs(12),
-                    call_openrouter(&cl, &k, &model, &msgs, effective_temp, max_tokens),
-                )
-                .await;
-                match res {
-                    Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(e)) => Err((model, e)),
-                    Err(_) => Err((model, ApiError::Timeout)),
-                }
-            }));
-        }
-    }
-
-    if !gk_val.is_empty() {
-        for m in GROQ_MODELS {
-            let model = m.to_string();
-            let cl = client.clone();
-            let k = gk_val.clone();
-            let msgs = Arc::clone(&messages);
-            unordered.push(Box::pin(async move {
-                let res = timeout(
-                    Duration::from_secs(12),
-                    call_groq(&cl, &k, &model, &msgs, effective_temp, max_tokens),
-                )
-                .await;
-                match res {
-                    Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(e)) => Err((model, e)),
-                    Err(_) => Err((model, ApiError::Timeout)),
-                }
-            }));
-        }
-    }
-
-    if !google_key.is_empty() {
-        for m in GOOGLE_MODELS {
-            let model = m.to_string();
-            let cl = client.clone();
-            let k = google_key.clone();
-            let msgs = Arc::clone(&messages);
-            unordered.push(Box::pin(async move {
-                let res = timeout(
-                    Duration::from_secs(12),
-                    call_google(&cl, &k, &model, &msgs, effective_temp, max_tokens),
-                )
-                .await;
-                match res {
-                    Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(e)) => Err((model, e)),
-                    Err(_) => Err((model, ApiError::Timeout)),
-                }
-            }));
-        }
-    }
-
-    if !nv_key.is_empty() {
-        for m in NVIDIA_MODELS {
-            let model = m.to_string();
-            let cl = client.clone();
-            let k = nv_key.clone();
-            let msgs = Arc::clone(&messages);
-            unordered.push(Box::pin(async move {
-                let res = timeout(
-                    Duration::from_secs(12),
-                    call_nvidia(&cl, &k, &model, &msgs, effective_temp, max_tokens),
-                )
-                .await;
-                match res {
-                    Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(e)) => Err((model, e)),
-                    Err(_) => Err((model, ApiError::Timeout)),
-                }
-            }));
-        }
-    }
-
-    // OpenCode gateway
-    for m in OPENCODE_GATEWAY_MODELS {
-        let model = m.to_string();
-        let cl = client.clone();
-        let msgs = Arc::clone(&messages);
-        let gk_clone = gw_key.clone();
-        unordered.push(Box::pin(async move {
-            let base = get_opencode_gateway_url();
-            let url = format!("{}/v1/chat/completions", base);
-            let res = timeout(
-                Duration::from_secs(8),
-                call_api(
-                    &cl,
-                    &url,
-                    |r| {
-                        if gk_clone.is_empty() {
-                            r
-                        } else {
-                            r.header("Authorization", format!("Bearer {}", &gk_clone))
-                        }
-                    },
-                    &model,
-                    &msgs,
-                    effective_temp,
-                    max_tokens,
-                ),
-            )
-            .await;
-            match res {
-                Ok(Ok(resp)) => Ok(resp),
-                Ok(Err(e)) => Err((model, e)),
-                Err(_) => Err((model, ApiError::Timeout)),
-            }
-        }));
-    }
+    let mut unordered = build_provider_futures(
+        client,
+        &messages,
+        effective_temp,
+        max_tokens,
+        Duration::from_secs(12),
+        Duration::from_secs(8),
+    );
 
     // Early cancellation: return as soon as we get a good response (score > 15.0)
     // or collect all and pick best
@@ -1173,14 +1202,6 @@ pub async fn process_code_query(
     let mut iterations = 0;
     const MAX_ITER: usize = 25;
 
-    // Cache API keys once
-    let ak = get_openrouter_key();
-    let gk = get_groq_key();
-    let gk_val = gk.clone().unwrap_or_default();
-    let google_key = get_google_key();
-    let nv_key = get_nvidia_key();
-    let gw_key = std::env::var("OPENCODE_GATEWAY_KEY").unwrap_or_default();
-
     loop {
         iterations += 1;
         if iterations > MAX_ITER {
@@ -1190,134 +1211,14 @@ pub async fn process_code_query(
 
         let messages_arc = Arc::new(messages.clone());
 
-        let mut unordered: FuturesUnordered<
-            Pin<Box<dyn std::future::Future<Output = ModelResult> + Send>>,
-        > = FuturesUnordered::new();
-
-        if !ak.is_empty() {
-            for m in get_models() {
-                let model = m;
-                let cl = client.clone();
-                let k = ak.clone();
-                let msgs = Arc::clone(&messages_arc);
-                let m2 = model.clone();
-                unordered.push(Box::pin(async move {
-                    let res = timeout(
-                        Duration::from_secs(20),
-                        call_openrouter(&cl, &k, &model, &msgs, effective_temp, max_tokens),
-                    )
-                    .await;
-                    match res {
-                        Ok(Ok(resp)) => Ok(resp),
-                        Ok(Err(e)) => Err((model, e)),
-                        Err(_) => Err((m2, ApiError::Timeout)),
-                    }
-                }));
-            }
-        }
-
-        if !gk_val.is_empty() {
-            for m in GROQ_MODELS {
-                let model = m.to_string();
-                let cl = client.clone();
-                let k = gk_val.clone();
-                let msgs = Arc::clone(&messages_arc);
-                let m2 = model.clone();
-                unordered.push(Box::pin(async move {
-                    let res = timeout(
-                        Duration::from_secs(20),
-                        call_groq(&cl, &k, &model, &msgs, effective_temp, max_tokens),
-                    )
-                    .await;
-                    match res {
-                        Ok(Ok(resp)) => Ok(resp),
-                        Ok(Err(e)) => Err((model, e)),
-                        Err(_) => Err((m2, ApiError::Timeout)),
-                    }
-                }));
-            }
-        }
-
-        if !google_key.is_empty() {
-            for m in GOOGLE_MODELS {
-                let model = m.to_string();
-                let cl = client.clone();
-                let k = google_key.clone();
-                let msgs = Arc::clone(&messages_arc);
-                let m2 = model.clone();
-                unordered.push(Box::pin(async move {
-                    let res = timeout(
-                        Duration::from_secs(20),
-                        call_google(&cl, &k, &model, &msgs, effective_temp, max_tokens),
-                    )
-                    .await;
-                    match res {
-                        Ok(Ok(resp)) => Ok(resp),
-                        Ok(Err(e)) => Err((model, e)),
-                        Err(_) => Err((m2, ApiError::Timeout)),
-                    }
-                }));
-            }
-        }
-
-        if !nv_key.is_empty() {
-            for m in NVIDIA_MODELS {
-                let model = m.to_string();
-                let cl = client.clone();
-                let k = nv_key.clone();
-                let msgs = Arc::clone(&messages_arc);
-                let m2 = model.clone();
-                unordered.push(Box::pin(async move {
-                    let res = timeout(
-                        Duration::from_secs(20),
-                        call_nvidia(&cl, &k, &model, &msgs, effective_temp, max_tokens),
-                    )
-                    .await;
-                    match res {
-                        Ok(Ok(resp)) => Ok(resp),
-                        Ok(Err(e)) => Err((model, e)),
-                        Err(_) => Err((m2, ApiError::Timeout)),
-                    }
-                }));
-            }
-        }
-
-        // OpenCode gateway
-        for m in OPENCODE_GATEWAY_MODELS {
-            let model = m.to_string();
-            let cl = client.clone();
-            let msgs = Arc::clone(&messages_arc);
-            let m2 = model.clone();
-            let gk_clone = gw_key.clone();
-            unordered.push(Box::pin(async move {
-                let base = get_opencode_gateway_url();
-                let url = format!("{}/v1/chat/completions", base);
-                let res = timeout(
-                    Duration::from_secs(15),
-                    call_api(
-                        &cl,
-                        &url,
-                        |r| {
-                            if gk_clone.is_empty() {
-                                r
-                            } else {
-                                r.header("Authorization", format!("Bearer {}", &gk_clone))
-                            }
-                        },
-                        &model,
-                        &msgs,
-                        effective_temp,
-                        max_tokens,
-                    ),
-                )
-                .await;
-                match res {
-                    Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(e)) => Err((m2, e)),
-                    Err(_) => Err((m2, ApiError::Timeout)),
-                }
-            }));
-        }
+        let mut unordered = build_provider_futures(
+            client,
+            &messages_arc,
+            effective_temp,
+            max_tokens,
+            Duration::from_secs(20),
+            Duration::from_secs(15),
+        );
 
         // Early cancellation: return on first good response (score > 40)
         let mut best_resp: Option<String> = None;
@@ -1345,7 +1246,7 @@ pub async fn process_code_query(
 
         // Drain remaining futures
         if best_resp.is_some() {
-            while let Some(_) = unordered.next().await {}
+            while unordered.next().await.is_some() {}
         }
 
         let resp = match best_resp {
@@ -1362,7 +1263,8 @@ pub async fn process_code_query(
         // Check for text-based tool call
         let tool_call = tc_re.captures(&resp).and_then(|caps| {
             let tag = caps.get(1)?.as_str();
-            let json_str = caps.get(2)?.as_str();
+            let after_tag = &resp[caps.get(0).unwrap().end()..];
+            let json_str = extract_balanced_json(after_tag)?;
             if tag == "tool_call" {
                 serde_json::from_str::<ToolCallText>(json_str).ok()
             } else {
@@ -1375,6 +1277,13 @@ pub async fn process_code_query(
         });
 
         if let Some(tc) = tool_call {
+            eprintln!(
+                "{} {} {}",
+                "[code-agent]".cyan(),
+                "Running:".dimmed(),
+                format!("{} {}", tc.name, summarize_args(&tc.arguments)).yellow()
+            );
+
             messages = Arc::try_unwrap(messages_arc).unwrap_or_else(|arc| (*arc).clone());
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
@@ -1404,11 +1313,66 @@ struct ToolCallText {
     arguments: Value,
 }
 
+/// Creates a short human-readable summary of tool arguments for progress display.
+fn summarize_args(args: &Value) -> String {
+    if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+        let short: String = cmd.chars().take(60).collect();
+        if cmd.len() > 60 {
+            format!("`{}…`", short)
+        } else {
+            format!("`{}`", short)
+        }
+    } else if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+        path.to_string()
+    } else if let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) {
+        pattern.to_string()
+    } else {
+        String::new()
+    }
+}
+
 fn tool_call_re() -> &'static Regex {
     static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"<(tool_call|bash|read_file|write_file|edit_file|grep|glob|list_dir)>\s*(\{.*?\})\s*</[a-z_]+>").unwrap()
+        Regex::new(r"<(tool_call|bash|read_file|write_file|edit_file|grep|glob|list_dir)>\s*").unwrap()
     });
     &RE
+}
+
+/// Extracts a balanced JSON object from `s` starting at the first `{`.
+/// Returns the slice covering the outermost `{...}` pair, handling nested
+/// braces and strings correctly.
+fn extract_balanced_json(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let bytes = s.as_bytes();
+    let mut depth = 0u32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes[start..].iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if b == b'\\' && in_string {
+            escaped = true;
+            continue;
+        }
+        if b == b'"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        if b == b'{' {
+            depth += 1;
+        } else if b == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&s[start..start + i + 1]);
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1552,7 +1516,7 @@ mod tests {
     #[test]
     fn test_auto_temperature_default() {
         let temp = auto_temperature("tell me something interesting");
-        assert!(temp >= 0.3 && temp <= 0.8);
+        assert!((0.3..=0.8).contains(&temp));
     }
 
     // -- auto_max_tokens tests --

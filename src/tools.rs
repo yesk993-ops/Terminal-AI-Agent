@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
-use std::path::Path;
 use std::process::Command as StdCommand;
+
+use glob::glob as glob_match;
 
 pub fn all_tool_defs() -> Vec<Value> {
     vec![
@@ -222,9 +223,19 @@ fn exec_edit_file(args: &Value) -> String {
     if !content.contains(old) {
         return format!("Error: old_string not found in {}", path);
     }
-    let new_content = content.replace(old, new);
+    let count = content.matches(old).count();
+    let new_content = content.replacen(old, new, 1);
     match std::fs::write(path, &new_content) {
-        Ok(_) => format!("Replaced text in {}", path),
+        Ok(_) => {
+            if count > 1 {
+                format!(
+                    "Replaced 1 of {} occurrences in {} (provide more context to target a specific one)",
+                    count, path
+                )
+            } else {
+                format!("Replaced text in {}", path)
+            }
+        }
         Err(e) => format!("Error writing file: {}", e),
     }
 }
@@ -331,42 +342,41 @@ async fn exec_glob(args: &Value) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or(".")
         .to_string();
-    let pattern = pattern.to_string();
+
+    let full_pattern = if path == "." {
+        pattern.to_string()
+    } else {
+        format!("{}/{}", path.trim_end_matches('/'), pattern.trim_start_matches('/'))
+    };
 
     match tokio::task::spawn_blocking(move || {
-        let mut cmd = StdCommand::new("find");
-        cmd.arg(&path);
-        if let Some(dir) = Path::new(&pattern).parent() {
-            if !dir.to_string_lossy().is_empty() {
-                cmd.arg("-path");
-                cmd.arg(format!("*/{}", dir.to_string_lossy()));
-                cmd.arg("-prune");
-                cmd.arg("-o");
-            }
-        }
-        cmd.arg("-name");
-        cmd.arg(Path::new(&pattern)
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_else(|| pattern.to_string()));
-        cmd.output()
-    })
-    .await {
-        Ok(Ok(out)) => {
-            let result = String::from_utf8_lossy(&out.stdout).to_string();
-            if result.is_empty() {
-                "(no matches)".to_string()
-            } else {
-                let lines: Vec<&str> = result.lines().collect();
-                if lines.len() > 100 {
-                    let truncated: Vec<&str> = lines[..100].to_vec();
-                    format!("{}\n... ({} more matches)", truncated.join("\n"), lines.len() - 100)
+        let mut results: Vec<String> = Vec::new();
+        match glob_match(&full_pattern) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    results.push(entry.to_string_lossy().to_string());
+                }
+                results.sort();
+                if results.is_empty() {
+                    "(no matches)".to_string()
+                } else if results.len() > 100 {
+                    let truncated: Vec<String> = results[..100].to_vec();
+                    format!(
+                        "{}\n... ({} more matches)",
+                        truncated.join("\n"),
+                        results.len() - 100
+                    )
                 } else {
-                    result
+                    results.join("\n")
                 }
             }
+            Err(e) => format!("Glob error: {}", e),
         }
-        _ => "find error: failed to spawn".to_string(),
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => "Failed to spawn glob task".to_string(),
     }
 }
 
@@ -394,5 +404,273 @@ fn exec_list_dir(args: &Value) -> String {
             }
         }
         Err(e) => format!("Error reading directory: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+    use std::io::Write;
+
+    // --- read_file ---
+
+    #[test]
+    fn test_read_file_success() {
+        let dir = std::env::temp_dir().join("tai_test_read");
+        fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("test.txt");
+        fs::write(&file_path, "hello\nworld\n").unwrap();
+
+        let args = json!({"path": file_path.to_str().unwrap()});
+        let result = exec_read_file(&args);
+        assert!(result.contains("hello"));
+        assert!(result.contains("world"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_read_file_missing() {
+        let args = json!({"path": "/nonexistent/path/file.txt"});
+        let result = exec_read_file(&args);
+        assert!(result.starts_with("Error reading file:"));
+    }
+
+    #[test]
+    fn test_read_file_missing_arg() {
+        let args = json!({});
+        assert_eq!(exec_read_file(&args), "Missing argument: path");
+    }
+
+    #[test]
+    fn test_read_file_truncation() {
+        let dir = std::env::temp_dir().join("tai_test_trunc");
+        fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("big.txt");
+        let mut f = fs::File::create(&file_path).unwrap();
+        for i in 0..2100 {
+            writeln!(f, "line {}", i).unwrap();
+        }
+        drop(f);
+
+        let args = json!({"path": file_path.to_str().unwrap()});
+        let result = exec_read_file(&args);
+        assert!(result.contains("truncated"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- write_file ---
+
+    #[test]
+    fn test_write_file_success() {
+        let dir = std::env::temp_dir().join("tai_test_write");
+        fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("out.txt");
+        let content = "hello from test";
+
+        let args = json!({"path": file_path.to_str().unwrap(), "content": content});
+        let result = exec_write_file(&args);
+        assert!(result.contains("Written"));
+        assert!(result.contains(&content.len().to_string()));
+
+        let read_back = fs::read_to_string(&file_path).unwrap();
+        assert_eq!(read_back, content);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_write_file_missing_path() {
+        let args = json!({"content": "foo"});
+        assert_eq!(exec_write_file(&args), "Missing argument: path");
+    }
+
+    #[test]
+    fn test_write_file_missing_content() {
+        let args = json!({"path": "/tmp/foo"});
+        assert_eq!(exec_write_file(&args), "Missing argument: content");
+    }
+
+    // --- edit_file ---
+
+    #[test]
+    fn test_edit_file_single_occurrence() {
+        let dir = std::env::temp_dir().join("tai_test_edit");
+        fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("edit.txt");
+        fs::write(&file_path, "before middle after").unwrap();
+
+        let args = json!({"path": file_path.to_str().unwrap(), "old_string": "middle", "new_string": "center"});
+        let result = exec_edit_file(&args);
+        assert!(result.contains("Replaced text in"));
+
+        let content = fs::read_to_string(&file_path).unwrap();
+        assert_eq!(content, "before center after");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_edit_file_duplicate_warning() {
+        let dir = std::env::temp_dir().join("tai_test_edit_dup");
+        fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("dup.txt");
+        fs::write(&file_path, "foo bar foo").unwrap();
+
+        let args = json!({"path": file_path.to_str().unwrap(), "old_string": "foo", "new_string": "baz"});
+        let result = exec_edit_file(&args);
+        assert!(result.contains("1 of 2 occurrences"));
+
+        let content = fs::read_to_string(&file_path).unwrap();
+        assert_eq!(content, "baz bar foo");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_edit_file_not_found() {
+        let dir = std::env::temp_dir().join("tai_test_edit_nf");
+        fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("nf.txt");
+        fs::write(&file_path, "hello").unwrap();
+
+        let args = json!({"path": file_path.to_str().unwrap(), "old_string": "nope", "new_string": "yes"});
+        let result = exec_edit_file(&args);
+        assert!(result.contains("not found"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_edit_file_missing_args() {
+        assert_eq!(exec_edit_file(&json!({})), "Missing argument: path");
+        assert_eq!(exec_edit_file(&json!({"path": "/x"})), "Missing argument: old_string");
+        assert_eq!(exec_edit_file(&json!({"path": "/x", "old_string": "a"})), "Missing argument: new_string");
+    }
+
+    // --- bash ---
+
+    #[tokio::test]
+    async fn test_bash_echo() {
+        let args = json!({"command": "echo hello"});
+        let result = exec_bash(&args).await;
+        assert!(result.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_missing_arg() {
+        let args = json!({});
+        assert_eq!(exec_bash(&args).await, "Missing argument: command");
+    }
+
+    #[tokio::test]
+    async fn test_bash_no_output() {
+        let args = json!({"command": "true"});
+        let result = exec_bash(&args).await;
+        assert_eq!(result, "(no output)");
+    }
+
+    // --- grep ---
+
+    #[tokio::test]
+    async fn test_grep_missing_arg() {
+        let args = json!({});
+        assert_eq!(exec_grep(&args).await, "Missing argument: pattern");
+    }
+
+    // --- glob ---
+
+    #[tokio::test]
+    async fn test_glob_finds_files() {
+        let dir = std::env::temp_dir().join("tai_test_glob");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.rs"), "").unwrap();
+        fs::write(dir.join("b.rs"), "").unwrap();
+        fs::write(dir.join("c.txt"), "").unwrap();
+
+        let args = json!({"pattern": "*.rs", "path": dir.to_str().unwrap()});
+        let result = exec_glob(&args).await;
+        assert!(result.contains("a.rs"));
+        assert!(result.contains("b.rs"));
+        assert!(!result.contains("c.txt"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_glob_no_matches() {
+        let dir = std::env::temp_dir().join("tai_test_glob_empty");
+        fs::create_dir_all(&dir).unwrap();
+
+        let args = json!({"pattern": "*.xyz", "path": dir.to_str().unwrap()});
+        let result = exec_glob(&args).await;
+        assert_eq!(result, "(no matches)");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_glob_missing_arg() {
+        let args = json!({});
+        assert_eq!(exec_glob(&args).await, "Missing argument: pattern");
+    }
+
+    // --- list_dir ---
+
+    #[test]
+    fn test_list_dir_contents() {
+        let dir = std::env::temp_dir().join("tai_test_list");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("file1.txt"), "").unwrap();
+        fs::create_dir(dir.join("subdir")).unwrap();
+
+        let args = json!({"path": dir.to_str().unwrap()});
+        let result = exec_list_dir(&args);
+        assert!(result.contains("file1.txt"));
+        assert!(result.contains("subdir/"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_list_dir_empty() {
+        let dir = std::env::temp_dir().join("tai_test_list_empty");
+        fs::create_dir_all(&dir).unwrap();
+
+        let args = json!({"path": dir.to_str().unwrap()});
+        let result = exec_list_dir(&args);
+        assert_eq!(result, "(empty directory)");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_list_dir_missing_arg() {
+        let args = json!({});
+        assert_eq!(exec_list_dir(&args), "Missing argument: path");
+    }
+
+    // --- execute_tool ---
+
+    #[tokio::test]
+    async fn test_execute_tool_unknown() {
+        let result = execute_tool("nonexistent", &json!({})).await;
+        assert!(result.contains("Unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_tool_dispatches_to_read() {
+        let dir = std::env::temp_dir().join("tai_test_dispatch");
+        fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("dispatch.txt");
+        fs::write(&file_path, "dispatch content").unwrap();
+
+        let result = execute_tool("read_file", &json!({"path": file_path.to_str().unwrap()})).await;
+        assert!(result.contains("dispatch content"));
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

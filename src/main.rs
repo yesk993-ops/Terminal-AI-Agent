@@ -11,6 +11,14 @@ fn parse_args() -> (String, f32, bool) {
     let mut i = 1;
     while i < raw.len() {
         match raw[i].as_str() {
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!("terminal_ai_agent v{}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--temperature" | "--temp" => {
                 if i + 1 < raw.len() {
                     temperature = raw[i + 1].parse().unwrap_or(0.8);
@@ -28,6 +36,35 @@ fn parse_args() -> (String, f32, bool) {
         i += 1;
     }
     (query, temperature.clamp(0.0, 2.0), code_mode)
+}
+
+fn print_help() {
+    println!("Terminal AI Agent v{}", env!("CARGO_PKG_VERSION"));
+    println!("A fast, colorful AI agent for your terminal.");
+    println!();
+    println!("USAGE:");
+    println!("  terminal_ai_agent [OPTIONS] [QUERY]");
+    println!();
+    println!("OPTIONS:");
+    println!("  --help, -h           Show this help message");
+    println!("  --version, -V        Show version information");
+    println!("  --code               Enable coding agent mode (read/write/edit/bash/grep/glob)");
+    println!("  --temp, --temperature <FLOAT>  Set temperature (0.0-2.0, default: 0.8)");
+    println!();
+    println!("EXAMPLES:");
+    println!("  terminal_ai_agent \"What is Rust?\"");
+    println!("  terminal_ai_agent --code \"create a Dockerfile\"");
+    println!("  terminal_ai_agent --temp 0.3 \"Explain quantum computing\"");
+    println!("  terminal_ai_agent                (starts REPL mode)");
+    println!();
+    println!("PROVIDERS:");
+    println!("  OpenRouter, Groq, Google Gemini, NVIDIA NIM, OpenCode Gateway");
+    println!("  Set API keys via environment variables:");
+    println!("    OPENROUTER_API_KEY, GROQ_API_KEY, GOOGLE_API_KEY, NVIDIA_API_KEY");
+    println!();
+    println!("REPL COMMANDS:");
+    println!("  ask <question>        Send a query to the AI");
+    println!("  exit                  Quit the REPL");
 }
 
 #[tokio::main]
