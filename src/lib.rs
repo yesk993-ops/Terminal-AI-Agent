@@ -1075,7 +1075,6 @@ pub async fn process_query(
     // Order: Groq (fastest) → OpenRouter models
     let mut response: Option<String> = None;
     let mut attempts: Vec<String> = Vec::new();
-    let timeout_dur = Duration::from_secs(5);
 
     // Helper to try a single model call with retry for 429s
     async fn try_model<F, Fut>(f: F, model: &str, delay_ms: u64) -> (Option<String>, String)
