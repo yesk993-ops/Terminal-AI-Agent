@@ -805,8 +805,8 @@ where
             Ok(Ok(resp)) => {
                 return (Some(resp), String::new());
             }
-            Ok(Err(ApiError::Http { status: 429, .. })) => {
-                last_err = format!("{}: Rate limited", model);
+            Ok(Err(ApiError::Http { status: 429, detail })) => {
+                last_err = format!("{}: Rate limited — {}", model, detail);
                 if attempt == 0 {
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     continue;
@@ -873,9 +873,8 @@ pub async fn process_query(
     // 1. Try Groq first (fastest, ~200ms)
     if response.is_none() && !gk_val.is_empty() {
         for model in GROQ_MODELS {
-            let msgs = (*messages).clone();
             let (resp, err) = try_model(
-                || call_groq(client, &gk_val, model, &msgs, effective_temp, max_tokens),
+                || call_groq(client, &gk_val, model, messages.as_ref(), effective_temp, max_tokens),
                 model,
                 3000,
             )
@@ -897,11 +896,10 @@ pub async fn process_query(
     // 2. Try OpenRouter models one at a time
     if response.is_none() && !ak.is_empty() {
         for model in get_models() {
-            let msgs = (*messages).clone();
             let (resp, err) = try_model(
-                || call_openrouter(client, &ak, &model, &msgs, effective_temp, max_tokens),
+                || call_openrouter(client, &ak, &model, messages.as_ref(), effective_temp, max_tokens),
                 &model,
-                1000,
+                5000,
             )
             .await;
             if let Some(r) = resp {
@@ -1046,14 +1044,18 @@ pub async fn process_code_query(
         // 1. Groq first (fastest)
         if resp.is_none() && !gk_val.is_empty() {
             for model in GROQ_MODELS {
-                let msgs = messages.clone();
                 let (r, err) = try_model(
-                    || call_groq(client, &gk_val, model, &msgs, effective_temp, max_tokens),
+                    || call_groq(client, &gk_val, model, &messages, effective_temp, max_tokens),
                     model,
                     3000,
                 )
                 .await;
                 if let Some(result) = r {
+                    // Tool call responses bypass quality scoring — accept immediately
+                    if result.contains("<tool_call>") || result.contains("<bash>") || result.contains("<read_file>") || result.contains("<write_file>") || result.contains("<edit_file>") || result.contains("<grep>") || result.contains("<glob>") || result.contains("<list_dir>") {
+                        resp = Some(result);
+                        break;
+                    }
                     let score = score_response(&result);
                     if score > 0.0 {
                         resp = Some(result);
@@ -1069,14 +1071,18 @@ pub async fn process_code_query(
         // 2. OpenRouter models one at a time
         if resp.is_none() && !ak.is_empty() {
             for model in get_models() {
-                let msgs = messages.clone();
                 let (r, err) = try_model(
-                    || call_openrouter(client, &ak, &model, &msgs, effective_temp, max_tokens),
+                    || call_openrouter(client, &ak, &model, &messages, effective_temp, max_tokens),
                     &model,
                     5000,
                 )
                 .await;
                 if let Some(result) = r {
+                    // Tool call responses bypass quality scoring
+                    if result.contains("<tool_call>") || result.contains("<bash>") || result.contains("<read_file>") || result.contains("<write_file>") || result.contains("<edit_file>") || result.contains("<grep>") || result.contains("<glob>") || result.contains("<list_dir>") {
+                        resp = Some(result);
+                        break;
+                    }
                     let score = score_response(&result);
                     if score > 0.0 {
                         resp = Some(result);
@@ -1139,6 +1145,7 @@ pub async fn process_code_query(
                 tool_calls: None,
                 tool_call_id: None,
             });
+            save_conversation().await;
         } else {
             println!("{}", format_response(&response));
             save_conversation().await;
