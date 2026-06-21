@@ -263,6 +263,8 @@ install_global() {
             local BIN_PATH="$TARGET_DIR/target/release/terminal_ai_agent.exe"
             if [ -f "$BIN_PATH" ]; then
                 # Try to auto-install (requires admin) — fall back gracefully
+                # rm before cp to avoid "Text file busy" when binary is running
+                rm -f "C:/Windows/System32/terminal_ai_agent.exe" 2>/dev/null || true
                 if cp "$BIN_PATH" "C:/Windows/System32/terminal_ai_agent.exe" 2>/dev/null; then
                     chmod +x "C:/Windows/System32/terminal_ai_agent.exe" 2>/dev/null || true
                     # Create ask.cmd wrapper so 'ask' works from cmd/powershell too
@@ -284,13 +286,12 @@ BAT
             ;;
         *)
             echo -e "${YELLOW}Installing to /usr/local/bin/...${NC}"
+            # rm before cp to avoid "Text file busy" when the binary is currently running
+            sudo rm -f /usr/local/bin/terminal_ai_agent /usr/local/bin/ask
             sudo cp "$TARGET_DIR/target/release/terminal_ai_agent" /usr/local/bin/
             sudo chmod +x /usr/local/bin/terminal_ai_agent
             # Install an `ask` wrapper so `ask <query>` works immediately
-            sudo tee /usr/local/bin/ask > /dev/null << 'SCRIPT'
-#!/usr/bin/env bash
-exec /usr/local/bin/terminal_ai_agent "$@"
-SCRIPT
+            printf '#!/usr/bin/env bash\nexec /usr/local/bin/terminal_ai_agent "$@"\n' | sudo tee /usr/local/bin/ask > /dev/null
             sudo chmod +x /usr/local/bin/ask
             echo -e "${GREEN}Installed to /usr/local/bin/terminal_ai_agent${NC}"
             echo -e "${GREEN}Installed ask wrapper to /usr/local/bin/ask${NC}"
