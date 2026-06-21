@@ -258,9 +258,29 @@ build_project() {
 install_global() {
     case "$DISTRO" in
         windows)
-            echo -e "${YELLOW}Binary at: $TARGET_DIR/target/release/terminal_ai_agent.exe${NC}"
-            echo -e "${YELLOW}Add it to your PATH manually, or copy:${NC}"
-            echo "  copy \"$TARGET_DIR\\target\\release\\terminal_ai_agent.exe\" \"C:\\Windows\\System32\\\""
+            echo -e "${YELLOW}Installing globally to C:\\Windows\\System32\\...${NC}"
+            # Convert Unix path to Windows path for the binary
+            local BIN_PATH="$TARGET_DIR/target/release/terminal_ai_agent.exe"
+            if [ -f "$BIN_PATH" ]; then
+                # Try to auto-install (requires admin) — fall back gracefully
+                if cp "$BIN_PATH" "C:/Windows/System32/terminal_ai_agent.exe" 2>/dev/null; then
+                    chmod +x "C:/Windows/System32/terminal_ai_agent.exe" 2>/dev/null || true
+                    # Create ask.cmd wrapper so 'ask' works from cmd/powershell too
+                    cat > "C:/Windows/System32/ask.cmd" << 'BAT'
+@echo off
+terminal_ai_agent %*
+BAT
+                    echo -e "${GREEN}Installed terminal_ai_agent.exe to C:\\Windows\\System32\\${NC}"
+                    echo -e "${GREEN}Installed ask.cmd wrapper — use 'ask' from cmd, PowerShell, or Git Bash${NC}"
+                else
+                    echo -e "${YELLOW}Could not write to C:\\Windows\\System32\\(run as Admin?).${NC}"
+                    echo -e "${YELLOW}Binary at: $BIN_PATH${NC}"
+                    echo -e "${YELLOW}To install manually, run this terminal as Administrator and run:${NC}"
+                    echo "  copy \"$(cygpath -w "$BIN_PATH" 2>/dev/null || echo "$BIN_PATH")\" \"C:\Windows\System32\""
+                fi
+            else
+                echo -e "${YELLOW}Binary not found at $BIN_PATH — skipping global install.${NC}"
+            fi
             ;;
         *)
             echo -e "${YELLOW}Installing to /usr/local/bin/...${NC}"
