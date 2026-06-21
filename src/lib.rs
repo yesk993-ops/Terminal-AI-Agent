@@ -1,7 +1,7 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use colored::*;
 use regex::Regex;
@@ -94,13 +94,22 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
-#[derive(Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    temperature: f32,
-    max_tokens: u32,
-    stream: bool,
+#[derive(Serialize, Clone)]
+pub struct Tool {
+    pub r#type: String,
+    pub function: ToolFunction,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ToolFunction {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+#[derive(Serialize, Clone)]
+pub enum ToolChoice {
+    Auto(String),
 }
 
 #[derive(Deserialize)]
@@ -135,12 +144,15 @@ pub fn get_openrouter_key() -> String {
 }
 
 /// Returns the list of models to try on OpenRouter.
-pub fn get_models() -> Vec<String> {
-    if let Ok(m) = std::env::var("OPENROUTER_MODEL") {
-        vec![m]
-    } else {
-        FREE_MODELS.iter().map(|s| s.to_string()).collect()
-    }
+pub fn get_models() -> &'static Vec<String> {
+    static CACHED: LazyLock<Vec<String>> = LazyLock::new(|| {
+        if let Ok(m) = std::env::var("OPENROUTER_MODEL") {
+            vec![m]
+        } else {
+            FREE_MODELS.iter().map(|s| s.to_string()).collect()
+        }
+    });
+    &CACHED
 }
 
 /// Returns a Groq-compatible API key. Only returns the key if GROQ_API_KEY
@@ -158,6 +170,7 @@ pub fn get_groq_key() -> Result<String, String> {
 ///
 /// The `headers` closure receives a bare `RequestBuilder` (with Content-Type and User-Agent
 /// already set) and must add the Authorization header (or any provider-specific headers).
+/// Returns the full ChatMessage (content + tool_calls) for native function calling support.
 async fn call_api(
     client: &Client,
     url: &str,
@@ -166,14 +179,23 @@ async fn call_api(
     messages: &[ChatMessage],
     temperature: f32,
     max_tokens: u32,
-) -> Result<String, ApiError> {
-    let body = ChatRequest {
-        model: model.to_string(),
-        messages: messages.to_vec(),
-        temperature,
-        max_tokens,
-        stream: false,
-    };
+    tools: Option<Vec<Tool>>,
+    tool_choice: Option<ToolChoice>,
+) -> Result<ChatMessage, ApiError> {
+    // Build JSON body directly from references — avoids cloning the entire message list
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": false,
+    });
+    if let Some(t) = tools {
+        body["tools"] = serde_json::json!(t);
+    }
+    if let Some(tc) = tool_choice {
+        body["tool_choice"] = serde_json::json!(tc);
+    }
 
     let req = client
         .post(url)
@@ -226,25 +248,26 @@ async fn call_api(
     chat.choices
         .into_iter()
         .next()
-        .map(|c| c.message.content.unwrap_or_default())
+        .map(|c| c.message)
         .ok_or(ApiError::NoChoices)
 }
 
 /// Calls the OpenRouter API for a single model.
 pub async fn call_openrouter(
     client: &Client,
-    api_key: &str,
+    api_key: String,
     model: &str,
     messages: &[ChatMessage],
     temperature: f32,
     max_tokens: u32,
-) -> Result<String, ApiError> {
-    let k = api_key.to_string();
+    tools: Option<Vec<Tool>>,
+    tool_choice: Option<ToolChoice>,
+) -> Result<ChatMessage, ApiError> {
     call_api(
         client,
         "https://openrouter.ai/api/v1/chat/completions",
         move |r| {
-            r.header("Authorization", format!("Bearer {}", k))
+            r.header("Authorization", format!("Bearer {}", api_key))
                 .header("HTTP-Referer", "https://github.com/terminal-ai-agent")
                 .header("X-Title", "Terminal AI Agent")
         },
@@ -252,6 +275,8 @@ pub async fn call_openrouter(
         messages,
         temperature,
         max_tokens,
+        tools,
+        tool_choice,
     )
     .await
 }
@@ -259,21 +284,24 @@ pub async fn call_openrouter(
 /// Calls the Groq API for a single model.
 pub async fn call_groq(
     client: &Client,
-    api_key: &str,
+    api_key: String,
     model: &str,
     messages: &[ChatMessage],
     temperature: f32,
     max_tokens: u32,
-) -> Result<String, ApiError> {
-    let k = api_key.to_string();
+    tools: Option<Vec<Tool>>,
+    tool_choice: Option<ToolChoice>,
+) -> Result<ChatMessage, ApiError> {
     call_api(
         client,
         "https://api.groq.com/openai/v1/chat/completions",
-        move |r| r.header("Authorization", format!("Bearer {}", k)),
+        move |r| r.header("Authorization", format!("Bearer {}", api_key)),
         model,
         messages,
         temperature,
         max_tokens,
+        tools,
+        tool_choice,
     )
     .await
 }
@@ -525,13 +553,14 @@ pub fn format_response(resp: &str) -> String {
                 .to_string();
             processed = b_re
                 .replace_all(&processed, |caps: &regex::Captures| {
-                    // Bold text: bold + italic + underline + bright green
-                    format!("\x1b[1;3;4;92m{}\x1b[0m", &caps[1])
+                    // Bold text: bold + italic + underline + bright green (or gold for acronyms)
+                    let color = if is_acronym { "38;5;220" } else { "92" };
+                    format!("\x1b[1;3;4;{}m{}\x1b[0m", color, &caps[1])
                 })
                 .to_string();
             if is_acronym {
-                let stripped = a_re.replace_all(&processed, "").to_string();
-                processed = format!("\x1b[38;5;220m{}\x1b[0m", stripped);
+                // Wrap entire line in gold WITHOUT stripping inner ANSI formatting
+                processed = format!("\x1b[38;5;220m{}\x1b[0m", processed);
             }
             lines.push(processed);
         }
@@ -562,31 +591,41 @@ pub fn format_response(resp: &str) -> String {
 /// Factual/analytical questions get lower temperature for accuracy.
 /// Creative/code tasks get moderate temperature.
 fn auto_temperature(query: &str) -> f32 {
-    let lower = query.to_lowercase();
-    let factual_keywords = [
-        "what is", "who is", "when did", "where is", "how many",
-        "define", "explain", "difference between", "compare",
-        "version", "release date", "population", "capital",
-    ];
-    let creative_keywords = [
-        "write", "create", "generate", "design", "imagine",
-        "poem", "story", "haiku", "song", "brainstorm",
-    ];
-    let code_keywords = [
-        "code", "function", "implement", "refactor", "debug",
-        "error", "bug", "fix", "algorithm", "compile", "rust",
-        "python", "javascript", "dockerfile", "git",
-    ];
-
-    if factual_keywords.iter().any(|k| lower.contains(k)) {
-        0.2
-    } else if code_keywords.iter().any(|k| lower.contains(k)) {
-        0.4
-    } else if creative_keywords.iter().any(|k| lower.contains(k)) {
-        0.8
-    } else {
-        0.5
+    let query_lower = query.to_ascii_lowercase();
+    
+    // Check for factual keywords - case-insensitive without additional allocation
+    if query_lower.contains("what is") || query_lower.contains("who is") || 
+       query_lower.contains("when did") || query_lower.contains("where is") || 
+       query_lower.contains("how many") || query_lower.contains("define") ||
+       query_lower.contains("explain") || query_lower.contains("difference between") ||
+       query_lower.contains("compare") || query_lower.contains("version") ||
+       query_lower.contains("release date") || query_lower.contains("population") ||
+       query_lower.contains("capital") {
+        return 0.2;
     }
+    
+    // Check for code keywords
+    if query_lower.contains("code") || query_lower.contains("function") ||
+       query_lower.contains("implement") || query_lower.contains("refactor") ||
+       query_lower.contains("debug") || query_lower.contains("error") ||
+       query_lower.contains("bug") || query_lower.contains("fix") ||
+       query_lower.contains("algorithm") || query_lower.contains("compile") ||
+       query_lower.contains("rust") || query_lower.contains("python") ||
+       query_lower.contains("javascript") || query_lower.contains("dockerfile") ||
+       query_lower.contains("git") {
+        return 0.4;
+    }
+    
+    // Check for creative keywords
+    if query_lower.contains("write") || query_lower.contains("create") ||
+       query_lower.contains("generate") || query_lower.contains("design") ||
+       query_lower.contains("imagine") || query_lower.contains("poem") ||
+       query_lower.contains("story") || query_lower.contains("haiku") ||
+       query_lower.contains("song") || query_lower.contains("brainstorm") {
+        return 0.8;
+    }
+    
+    0.5
 }
 
 /// Returns a default max_tokens value based on query complexity.
@@ -638,17 +677,18 @@ fn score_response(resp: &str) -> f64 {
         structure += 5.0;
     }
 
-    // Penalty for refusals / low-effort
+    // Penalty for genuine refusals / low-effort
+    // NOTE: "as an ai" and "i don't have" / "i do not have" are NOT refusals —
+    // they are common conversational fillers that often precede valid answers.
     let lower = resp.to_lowercase();
     let refusal_phrases = [
         "i cannot", "i can't", "i'm unable", "i am unable",
-        "as an ai", "i don't have", "i do not have",
         "sorry, i", "unfortunately, i",
     ];
     let refusal_penalty: f64 = refusal_phrases
         .iter()
         .filter(|p| lower.contains(*p))
-        .map(|_| 30.0)
+        .map(|_| 15.0)
         .sum();
 
     (length_score + structure - refusal_penalty).max(0.0)
@@ -662,43 +702,42 @@ fn score_response(resp: &str) -> f64 {
 /// - Removes model self-identification boilerplate
 fn post_process_response(resp: &str) -> String {
     let mut result = String::with_capacity(resp.len());
-
-    // Strip common boilerplate prefixes from line starts (case-insensitive)
-    let stripped = resp
-        .lines()
-        .map(|line| {
-            let lower = line.trim().to_lowercase();
-            let trimmed = line.trim();
-            if lower.starts_with("here is ") {
-                trimmed[8..].trim_start()
-            } else if lower.starts_with("here are ") {
-                trimmed[9..].trim_start()
-            } else if lower.starts_with("sure, ") {
-                trimmed[6..].trim_start()
-            } else if lower.starts_with("of course, ") {
-                trimmed[11..].trim_start()
-            } else if lower.starts_with("certainly, ") {
-                trimmed[11..].trim_start()
-            } else {
-                line
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    // Collapse 3+ blank lines into 2
     let mut blank_count = 0u32;
-    for line in stripped.lines() {
-        if line.trim().is_empty() {
+
+    for line in resp.lines() {
+        let trimmed = line.trim();
+        
+        // Skip if empty
+        if trimmed.is_empty() {
             blank_count += 1;
             if blank_count <= 2 {
                 result.push('\n');
             }
-        } else {
-            blank_count = 0;
-            result.push_str(line.trim_end());
-            result.push('\n');
+            continue;
         }
+        
+        blank_count = 0;
+        
+        // Check prefixes without allocation - use case-insensitive comparison
+        let processed_line = {
+            let lower_trim = trimmed.to_ascii_lowercase();
+            if lower_trim.starts_with("here is ") {
+                &trimmed[8..].trim_start()
+            } else if lower_trim.starts_with("here are ") {
+                &trimmed[9..].trim_start()
+            } else if lower_trim.starts_with("sure, ") {
+                &trimmed[6..].trim_start()
+            } else if lower_trim.starts_with("of course, ") {
+                &trimmed[11..].trim_start()
+            } else if lower_trim.starts_with("certainly, ") {
+                &trimmed[11..].trim_start()
+            } else {
+                trimmed
+            }
+        };
+        
+        result.push_str(processed_line);
+        result.push('\n');
     }
 
     result.trim().to_string()
@@ -724,9 +763,11 @@ fn summarize_old_context(messages: &[ChatMessage], keep_recent: usize) -> Vec<Ch
             if trimmed.is_empty() {
                 continue;
             }
-            // Keep first 100 chars of each old message as summary
-            if trimmed.len() > 100 {
-                summary_parts.push(format!("{}...", &trimmed[..100]));
+            // Keep first 100 chars of each old message as summary (char-safe, no panic on multi-byte)
+            let char_count = trimmed.chars().count();
+            if char_count > 100 {
+                let truncated: String = trimmed.chars().take(100).collect();
+                summary_parts.push(format!("{}...", truncated));
             } else {
                 summary_parts.push(trimmed.to_string());
             }
@@ -792,32 +833,89 @@ fn chat_system_prompt() -> &'static str {
     &PROMPT
 }
 
+/// Per-model rate-limit cooldown: tracks when a model was last rate-limited
+/// so we skip it until the cooldown expires.
+static RATE_LIMIT_COOLDOWNS: LazyLock<std::sync::Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+const RATE_LIMIT_COOLDOWN_SECS: u64 = 15;
+
+/// Returns true if `model` is currently in rate-limit cooldown.
+fn is_model_on_cooldown(model: &str) -> bool {
+    let map = RATE_LIMIT_COOLDOWNS.lock().unwrap();
+    match map.get(model) {
+        Some(until) if *until > Instant::now() => true,
+        _ => false,
+    }
+}
+
+/// Marks `model` as rate-limited for `RATE_LIMIT_COOLDOWN_SECS`.
+fn mark_model_rate_limited(model: &str) {
+    let mut map = RATE_LIMIT_COOLDOWNS.lock().unwrap();
+    // Clean stale entries while we're at it
+    let now = Instant::now();
+    map.retain(|_, v| *v > now);
+    map.insert(model.to_string(), now + Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS));
+}
+
+/// Simple jitter: returns `base_ms` ± up to 25% using system-time nanosecond bits
+/// so retries don't align (avoiding thundering-herd).
+fn jitter_ms(base_ms: u64) -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let offset = (nanos % (base_ms as u32 / 2)).max(1) as u64;
+    if nanos % 2 == 0 {
+        base_ms + offset
+    } else {
+        base_ms.saturating_sub(offset)
+    }
+}
+
 /// Helper to try a single model call with retry for 429s.
-pub(crate) async fn try_model<F, Fut>(f: F, model: &str, delay_ms: u64) -> (Option<String>, String)
+///
+/// Uses exponential backoff with jitter and a global cooldown tracker.
+/// On 429, backs off then tries different models instead of exhausting retries on one.
+pub(crate) async fn try_model<F, Fut>(f: F, model: &str, delay_ms: u64) -> (Option<ChatMessage>, String)
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<String, ApiError>>,
+    Fut: std::future::Future<Output = Result<ChatMessage, ApiError>>,
 {
+    // Skip immediately if model is in cooldown
+    if is_model_on_cooldown(model) {
+        return (None, format!("{}: Skipped (rate-limit cooldown)", model));
+    }
+
+    const REQUEST_TIMEOUT_SECS: u64 = 5;
+    // 429 retries: fast backoff — only retry 2 times before falling through.
+    const MAX_429_RETRIES: u32 = 2;
+
     let mut last_err = String::new();
-    for attempt in 0..2 {
-        let res = timeout(Duration::from_secs(5), f()).await;
+    let mut consecutive_429s = 0u32;
+    for _ in 0..(MAX_429_RETRIES + 1) {
+        let res = timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), f()).await;
         match res {
-            Ok(Ok(resp)) => {
-                return (Some(resp), String::new());
+            Ok(Ok(msg)) => {
+                return (Some(msg), String::new());
             }
-            Ok(Err(ApiError::Http { status: 429, detail })) => {
-                last_err = format!("{}: Rate limited — {}", model, detail);
-                if attempt == 0 {
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                    continue;
+            Ok(Err(ApiError::Http { status: 429, .. })) => {
+                consecutive_429s += 1;
+                last_err = format!("{}: Rate limited (attempt {})", model, consecutive_429s);
+                if consecutive_429s >= MAX_429_RETRIES {
+                    mark_model_rate_limited(model);
+                    last_err = format!("{}: Rate limited — cooldown {}s", model, RATE_LIMIT_COOLDOWN_SECS);
+                    break;
                 }
+                let backoff = jitter_ms(delay_ms * (1 << (consecutive_429s - 1)));
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
             }
             Ok(Err(e)) => {
                 last_err = format!("{}: {}", model, e);
                 break;
             }
             Err(_) => {
-                last_err = format!("{}: Timeout", model);
+                last_err = format!("{}: Timeout ({}s)", model, REQUEST_TIMEOUT_SECS);
                 break;
             }
         }
@@ -825,7 +923,7 @@ where
     (None, last_err)
 }
 
-/// Runs a user query against all available models sequentially with scoring and fallback.
+/// Runs a user query against models concurrently with scoring and fallback.
 pub async fn process_query(
     client: &Client,
     query: &str,
@@ -851,67 +949,94 @@ pub async fn process_query(
         tool_call_id: None,
     };
 
-    push_conversation(user_msg.clone()).await;
-
     let raw_history = conversation_history().await;
-    let history = summarize_old_context(&raw_history, 12);
+    // Compress old messages: keep only the last 4 in full, summarize the rest.
+    // This keeps context small even after many conversation turns.
+    let history = summarize_old_context(&raw_history, 4);
 
     let mut msg_vec = vec![system_msg];
     msg_vec.extend(history);
-    let messages = Arc::new(msg_vec);
+    // CRITICAL: include the current user query in the messages sent to the API!
+    msg_vec.push(user_msg.clone());
+    // Share via Arc so each model avoids cloning the entire message vector
+    let msg_vec = Arc::new(msg_vec);
 
     // Collect API keys once
     let ak = get_openrouter_key();
     let gk = get_groq_key();
     let gk_val = gk.clone().unwrap_or_default();
+    let no_keys = ak.is_empty() && gk.is_err();
 
-    // Sequential fallback: try one model at a time to avoid rate limiting
-    // Order: Groq (fastest) → OpenRouter models
-    let mut response: Option<String> = None;
+    let mut retries = 0u32;
+    loop {
+    push_conversation(user_msg.clone()).await;
     let mut attempts: Vec<String> = Vec::new();
 
-    // 1. Try Groq first (fastest, ~200ms)
-    if response.is_none() && !gk_val.is_empty() {
-        for model in GROQ_MODELS {
-            let (resp, err) = try_model(
-                || call_groq(client, &gk_val, model, messages.as_ref(), effective_temp, max_tokens),
-                model,
-                3000,
-            )
-            .await;
-            if let Some(r) = resp {
-                let processed = post_process_response(&r);
-                let score = score_response(&processed);
-                if score > 0.0 {
-                    response = Some(processed);
-                    break;
-                }
-                attempts.push(format!("{}: low quality (score {:.0})", model, score));
-            } else {
-                attempts.push(err);
+    // Run ALL models concurrently (FuturesUnordered) — return the FIRST valid response
+    // Groq is fastest (~1-3s) and skips quality scoring since llama-3.3-70b is production-grade.
+    // OpenRouter models run in parallel as fallback if Groq errors out.
+    let mut response: Option<String> = None;
+    {
+        use futures_util::stream::FuturesUnordered;
+        use futures_util::StreamExt;
+        // Type-erase via Pin<Box<dyn Future>> so different async blocks are compatible
+        let mut futs: FuturesUnordered<std::pin::Pin<Box<dyn std::future::Future<Output = (Option<String>, String)> + Send>>> = FuturesUnordered::new();
+        // Add Groq model
+        if !gk_val.is_empty() {
+            for model in GROQ_MODELS {
+                let model_s = model.to_string();
+                let gk = gk_val.clone();
+                let mv = Arc::clone(&msg_vec);
+                futs.push(Box::pin(async move {
+                    let (msg, err) = try_model(
+                        || call_groq(client, gk.clone(), &model_s, &mv, effective_temp, max_tokens, None, None),
+                        &model_s,
+                        1000,
+                    ).await;
+                    if let Some(m) = msg {
+                        let text = m.content.unwrap_or_default();
+                        if !text.trim().is_empty() {
+                            let processed = post_process_response(&text);
+                            return (Some(processed), String::new());
+                        }
+                    }
+                    (None, err)
+                }));
             }
         }
-    }
-
-    // 2. Try OpenRouter models one at a time
-    if response.is_none() && !ak.is_empty() {
-        for model in get_models() {
-            let (resp, err) = try_model(
-                || call_openrouter(client, &ak, &model, messages.as_ref(), effective_temp, max_tokens),
-                &model,
-                5000,
-            )
-            .await;
-            if let Some(r) = resp {
-                let processed = post_process_response(&r);
-                let score = score_response(&processed);
-                if score > 0.0 {
-                    response = Some(processed);
-                    break;
-                }
-                attempts.push(format!("{}: low quality (score {:.0})", model, score));
-            } else {
-                attempts.push(err);
+        // Add all OpenRouter models
+        if !ak.is_empty() {
+            let or_models = get_models();
+            for model in or_models {
+                let model_s = model.clone();
+                let ak_c = ak.clone();
+                let mv = Arc::clone(&msg_vec);
+                futs.push(Box::pin(async move {
+                    let (msg, err) = try_model(
+                        || call_openrouter(client, ak_c.clone(), &model_s, &mv, effective_temp, max_tokens, None, None),
+                        &model_s,
+                        1000,
+                    ).await;
+                    if let Some(m) = msg {
+                        let text = m.content.unwrap_or_default();
+                        let processed = post_process_response(&text);
+                        let score = score_response(&processed);
+                        if score > 0.0 {
+                            return (Some(processed), String::new());
+                        }
+                        return (None, format!("{}: low quality (score {:.0})", model_s, score));
+                    }
+                    (None, err)
+                }));
+            }
+        }
+        while let Some((resp_opt, err_str)) = futs.next().await {
+            if let Some(r) = resp_opt {
+                response = Some(r);
+                break;
+            }
+            if !err_str.is_empty() {
+                attempts.push(err_str);
             }
         }
     }
@@ -929,10 +1054,20 @@ pub async fn process_query(
         return;
     }
 
-    // All failed
+    // All failed — check if all were rate-limit or transient issues, then auto-retry once
+    let all_rate_limited = attempts.iter().all(|a| {
+        a.contains("Rate limited") || a.contains("cooldown") || a.contains("Skipped")
+            || a.contains("Timeout")
+    });
+
     CONVERSATION.write().await.pop_back();
 
-    let no_keys = ak.is_empty() && gk.is_err();
+    if all_rate_limited && !no_keys && retries < 1 {
+        retries += 1;
+        eprintln!("{}", "All models rate-limited. Waiting 10s and retrying...".yellow());
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        continue;
+    }
 
     eprintln!("{}", "All free models failed.".red());
     for a in &attempts {
@@ -944,6 +1079,8 @@ pub async fn process_query(
             "No API keys set. Export OPENROUTER_API_KEY or GROQ_API_KEY."
                 .yellow()
         );
+    }
+    break;
     }
 }
 
@@ -994,8 +1131,8 @@ Examples:
 
 /// Runs a query in coding-agent mode with text-based tool calling.
 ///
-/// Uses Arc for messages (zero-copy sharing), early cancellation, and
-/// a special prompt for tool calling via text tags.
+/// Uses native function calling API for better reliability, falls back to
+/// text-based tool call parsing when native function calling is not supported.
 pub async fn process_code_query(
     client: &Client,
     query: &str,
@@ -1007,10 +1144,17 @@ pub async fn process_code_query(
         temperature
     };
     let max_tokens = 2048u32;
+    const MAX_MESSAGES: usize = 30;
+
+    // Cache API keys and system prompt outside the loop
+    let ak = get_openrouter_key();
+    let gk = get_groq_key();
+    let gk_val = gk.clone().unwrap_or_default();
+    let system_prompt = coding_system_prompt();
 
     let system_msg = ChatMessage {
         role: "system".to_string(),
-        content: Some(coding_system_prompt()),
+        content: Some(system_prompt),
         tool_calls: None,
         tool_call_id: None,
     };
@@ -1026,6 +1170,48 @@ pub async fn process_code_query(
     let mut iterations = 0;
     const MAX_ITER: usize = 25;
 
+    // Build tool definitions for native function calling (done once, reused)
+    let tool_defs: Vec<Tool> = tools::all_tool_defs()
+        .into_iter()
+        .filter_map(|v| {
+            let name = v["function"]["name"].as_str()?.to_string();
+            let description = v["function"]["description"].as_str()?.to_string();
+            let parameters = v["function"]["parameters"].clone();
+            Some(Tool {
+                r#type: "function".to_string(),
+                function: ToolFunction {
+                    name,
+                    description,
+                    parameters,
+                },
+            })
+        })
+        .collect();
+    let tools = Some(tool_defs);
+    let tool_choice = Some(ToolChoice::Auto("auto".to_string()));
+
+    fn trim_messages(msgs: &mut Vec<ChatMessage>) {
+        if msgs.len() > MAX_MESSAGES {
+            let system_msg = msgs[0].clone();
+            let keep = msgs.len() - MAX_MESSAGES + 1;
+            let mut new_msgs = vec![system_msg];
+            new_msgs.extend_from_slice(&msgs[keep..]);
+            *msgs = new_msgs;
+        }
+    }
+
+    fn msg_to_tool_call(msg: &ChatMessage) -> Option<ToolCallText> {
+        if let Some(ref tcs) = msg.tool_calls {
+            let tc = tcs.first()?;
+            let args: Value = serde_json::from_str(&tc.function.arguments).ok()?;
+            return Some(ToolCallText {
+                name: tc.function.name.clone(),
+                arguments: args,
+            });
+        }
+        None
+    }
+
     loop {
         iterations += 1;
         if iterations > MAX_ITER {
@@ -1033,70 +1219,106 @@ pub async fn process_code_query(
             break;
         }
 
-        // Sequential fallback: try one model at a time to avoid rate limiting
-        let ak = get_openrouter_key();
-        let gk = get_groq_key();
-        let gk_val = gk.clone().unwrap_or_default();
-
-        let mut resp: Option<String> = None;
         let mut attempts: Vec<String> = Vec::new();
 
-        // 1. Groq first (fastest)
-        if resp.is_none() && !gk_val.is_empty() {
+        // Try Groq and first OpenRouter model CONCURRENTLY for lower latency
+        let groq_fut = async {
+            if gk_val.is_empty() {
+                return (None::<ChatMessage>, Vec::new());
+            }
+            let mut att = Vec::new();
             for model in GROQ_MODELS {
-                let (r, err) = try_model(
-                    || call_groq(client, &gk_val, model, &messages, effective_temp, max_tokens),
-                    model,
-                    3000,
-                )
-                .await;
-                if let Some(result) = r {
-                    // Tool call responses bypass quality scoring — accept immediately
-                    if result.contains("<tool_call>") || result.contains("<bash>") || result.contains("<read_file>") || result.contains("<write_file>") || result.contains("<edit_file>") || result.contains("<grep>") || result.contains("<glob>") || result.contains("<list_dir>") {
-                        resp = Some(result);
-                        break;
+                let (msg, err) = try_model(
+                    || call_groq(client, gk_val.clone(), model, &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone()),
+                    model, 1000,
+                ).await;
+                if let Some(m) = msg {
+                    if m.tool_calls.is_some() || tc_re.is_match(&m.content.as_deref().unwrap_or("")) {
+                        return (Some(m), att);
                     }
-                    let score = score_response(&result);
+                    let text = m.content.as_deref().unwrap_or("");
+                    let score = score_response(text);
                     if score > 0.0 {
-                        resp = Some(result);
-                        break;
+                        return (Some(m), att);
                     }
-                    attempts.push(format!("{}: low quality (score {:.0})", model, score));
+                    att.push(format!("{}: low quality (score {:.0})", model, score));
                 } else {
-                    attempts.push(err);
+                    att.push(err);
+                }
+            }
+            (None::<ChatMessage>, att)
+        };
+        let or_fut = async {
+            if ak.is_empty() {
+                return (None::<ChatMessage>, Vec::new());
+            }
+            let models = get_models();
+            if models.is_empty() {
+                return (None, Vec::new());
+            }
+            let mut att = Vec::new();
+            let (msg, err) = try_model(
+                || call_openrouter(client, ak.clone(), &models[0], &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone()),
+                &models[0], 1000,
+            ).await;
+            if let Some(m) = msg {
+                if m.tool_calls.is_some() || tc_re.is_match(&m.content.as_deref().unwrap_or("")) {
+                    return (Some(m), att);
+                }
+                let text = m.content.as_deref().unwrap_or("");
+                let score = score_response(text);
+                if score > 0.0 {
+                    return (Some(m), att);
+                }
+                att.push(format!("{}: low quality (score {:.0})", models[0], score));
+            } else {
+                att.push(err);
+            }
+            (None::<ChatMessage>, att)
+        };
+        let ((groq_resp, groq_att), (or_resp, or_att)) = tokio::join!(groq_fut, or_fut);
+        attempts.extend(groq_att);
+        attempts.extend(or_att);
+
+        // Pick Groq response if both succeeded (Groq is cheaper/faster)
+        let mut response_msg = groq_resp.or(or_resp);
+
+        // Try remaining OpenRouter models CONCURRENTLY (join_all)
+        if response_msg.is_none() && !ak.is_empty() {
+            let models = get_models();
+            let remaining = &models[1..];
+            if !remaining.is_empty() {
+                use futures_util::future::join_all;
+                let futs: Vec<_> = remaining.iter().map(|model| {
+                    try_model(
+                        || call_openrouter(client, ak.clone(), model, &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone()),
+                        model,
+                        1000,
+                    )
+                }).collect();
+                let results = join_all(futs).await;
+                for (i, (msg, err)) in results.into_iter().enumerate() {
+                    if let Some(m) = msg {
+                        if m.tool_calls.is_some() || tc_re.is_match(&m.content.as_deref().unwrap_or("")) {
+                            response_msg = Some(m);
+                            break;
+                        }
+                        let text = m.content.as_deref().unwrap_or("");
+                        let score = score_response(text);
+                        if score > 0.0 {
+                            response_msg = Some(m);
+                            break;
+                        }
+                        attempts.push(format!("{}: low quality (score {:.0})", remaining[i], score));
+                    } else {
+                        attempts.push(err);
+                    }
                 }
             }
         }
 
-        // 2. OpenRouter models one at a time
-        if resp.is_none() && !ak.is_empty() {
-            for model in get_models() {
-                let (r, err) = try_model(
-                    || call_openrouter(client, &ak, &model, &messages, effective_temp, max_tokens),
-                    &model,
-                    5000,
-                )
-                .await;
-                if let Some(result) = r {
-                    // Tool call responses bypass quality scoring
-                    if result.contains("<tool_call>") || result.contains("<bash>") || result.contains("<read_file>") || result.contains("<write_file>") || result.contains("<edit_file>") || result.contains("<grep>") || result.contains("<glob>") || result.contains("<list_dir>") {
-                        resp = Some(result);
-                        break;
-                    }
-                    let score = score_response(&result);
-                    if score > 0.0 {
-                        resp = Some(result);
-                        break;
-                    }
-                    attempts.push(format!("{}: low quality (score {:.0})", model, score));
-                } else {
-                    attempts.push(err);
-                }
-            }
-        }
-
-        let response = match resp {
-            Some(r) => r,
+        let msg = match response_msg {
+            Some(m) => m,
             None => {
                 eprintln!("{}", "[code-agent] All models failed.".red());
                 for a in &attempts {
@@ -1106,10 +1328,42 @@ pub async fn process_code_query(
             }
         };
 
-        // Check for text-based tool call
-        let tool_call = tc_re.captures(&response).and_then(|caps| {
+        let response_text = msg.content.as_deref().unwrap_or("").to_string();
+
+        // Check for native tool calls (from function calling API)
+        if let Some(tc) = msg_to_tool_call(&msg) {
+            eprintln!(
+                "{} {} {}",
+                "[code-agent]".cyan(),
+                "Running:".dimmed(),
+                format!("{} {}", tc.name, summarize_args(&tc.arguments)).yellow()
+            );
+
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(response_text),
+                tool_calls: msg.tool_calls.clone(),
+                tool_call_id: None,
+            });
+
+            let result = tools::execute_tool(&tc.name, &tc.arguments).await;
+
+            messages.push(ChatMessage {
+                role: "tool".to_string(),
+                content: Some(format!("[tool result for {}]:\n{}", tc.name, result)),
+                tool_calls: None,
+                tool_call_id: msg.tool_calls.as_ref().and_then(|v| v.first().map(|tc| tc.id.clone())),
+            });
+
+            trim_messages(&mut messages);
+            save_conversation().await;
+            continue;
+        }
+
+        // Fallback: check for text-based tool call
+        let tool_call = tc_re.captures(&response_text).and_then(|caps| {
             let tag = caps.get(1)?.as_str();
-            let after_tag = &response[caps.get(0).unwrap().end()..];
+            let after_tag = &response_text[caps.get(0).unwrap().end()..];
             let json_str = extract_balanced_json(after_tag)?;
             if tag == "tool_call" {
                 serde_json::from_str::<ToolCallText>(json_str).ok()
@@ -1132,7 +1386,7 @@ pub async fn process_code_query(
 
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
-                content: Some(response.clone()),
+                content: Some(response_text),
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -1145,9 +1399,11 @@ pub async fn process_code_query(
                 tool_calls: None,
                 tool_call_id: None,
             });
+
+            trim_messages(&mut messages);
             save_conversation().await;
         } else {
-            println!("{}", format_response(&response));
+            println!("{}", format_response(&response_text));
             save_conversation().await;
             return;
         }
@@ -1215,6 +1471,9 @@ fn extract_balanced_json(s: &str) -> Option<&str> {
         if b == b'{' {
             depth += 1;
         } else if b == b'}' {
+            if depth == 0 {
+                break;
+            }
             depth -= 1;
             if depth == 0 {
                 end = Some(start + i + 1);
@@ -1223,7 +1482,6 @@ fn extract_balanced_json(s: &str) -> Option<&str> {
         }
     }
     let end = end?;
-    // Verify closing tag follows the JSON
     let after = s[end..].trim_start();
     if after.starts_with("</") {
         Some(&s[start..end])
@@ -1412,7 +1670,8 @@ mod tests {
     fn test_score_response_refusal_penalty() {
         let resp = "I cannot help with that request.";
         let score = score_response(resp);
-        assert!(score < 10.0);
+        // Genuine refusal gets penalized but not zeroed out
+        assert!(score > 0.0 && score < 15.0);
     }
 
     // -- post_process_response tests --

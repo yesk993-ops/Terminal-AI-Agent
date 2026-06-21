@@ -171,18 +171,30 @@ fn exec_read_file(args: &Value) -> String {
         Some(p) => p,
         None => return "Missing argument: path".to_string(),
     };
-    match std::fs::read_to_string(path) {
-        Ok(content) => {
-            let lines: Vec<&str> = content.lines().collect();
-            let total = lines.len();
-            let shown = lines.len().min(2000);
+    
+    // Use BufReader for streaming large files instead of loading entire file into memory
+    match std::fs::File::open(path) {
+        Ok(file) => {
+            use std::io::{BufRead, BufReader};
+            let reader = BufReader::new(file);
             let mut result = String::new();
-            for line in &lines[..shown] {
-                result.push_str(line);
-                result.push('\n');
+            let mut line_count = 0;
+            const MAX_LINES: usize = 2000;
+            
+            for line in reader.lines().take(MAX_LINES) {
+                match line {
+                    Ok(l) => {
+                        result.push_str(&l);
+                        result.push('\n');
+                        line_count += 1;
+                    }
+                    Err(e) => return format!("Error reading file: {}", e),
+                }
             }
-            if total > shown {
-                result.push_str(&format!("... ({} lines truncated)", total - shown));
+            
+            // Check if there are more lines without loading them all
+            if line_count == MAX_LINES {
+                result.push_str(&format!("... (more lines truncated)"));
             }
             result
         }
@@ -301,11 +313,35 @@ async fn exec_grep(args: &Value) -> String {
     let include = args.get("include").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     let pattern = pattern.to_string();
-    match tokio::task::spawn_blocking(move || {
-        let mut cmd = StdCommand::new("rg");
-        cmd.arg("-n");
+    let result = tokio::task::spawn_blocking(move || {
+        // Try ripgrep first (fastest), fall back to grep -rn
+        let has_rg = StdCommand::new("rg")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if has_rg {
+            let mut cmd = StdCommand::new("rg");
+            cmd.arg("-n");
+            if let Some(ref inc) = include {
+                cmd.arg("--glob");
+                cmd.arg(inc);
+            }
+            cmd.arg(&pattern);
+            cmd.arg(&path);
+            cmd.arg("-m").arg("50");
+            return cmd.output();
+        }
+
+        // Fallback: use grep -rn with --include if needed
+        let mut cmd = StdCommand::new("grep");
+        cmd.arg("-rn");
         if let Some(ref inc) = include {
-            cmd.arg("--glob");
+            cmd.arg("--include");
             cmd.arg(inc);
         }
         cmd.arg(&pattern);
@@ -313,7 +349,9 @@ async fn exec_grep(args: &Value) -> String {
         cmd.arg("-m").arg("50");
         cmd.output()
     })
-    .await {
+    .await;
+
+    match result {
         Ok(Ok(out)) => {
             let mut result = String::new();
             if !out.stdout.is_empty() {
@@ -334,7 +372,8 @@ async fn exec_grep(args: &Value) -> String {
             }
             result
         }
-        _ => "grep error: failed to spawn (is ripgrep installed?)".to_string(),
+        Ok(Err(e)) => format!("grep error: {}", e),
+        Err(_) => "Failed to spawn grep command".to_string(),
     }
 }
 
