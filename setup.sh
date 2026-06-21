@@ -289,18 +289,27 @@ setup_rc_alias() {
         *) rc="$HOME/.profile" ;;
     esac
 
-    if grep -q "terminal_ai_agent" "$rc" 2>/dev/null; then
-        return
-    fi
-
-    cat >> "$rc" << 'EOF'
+    # Add ask() function if not already present
+    if ! grep -q "terminal_ai_agent" "$rc" 2>/dev/null; then
+        cat >> "$rc" << 'EOF'
 
 # Terminal AI Agent — quick ask() shortcut
 ask() {
     /usr/local/bin/terminal_ai_agent "$@"
 }
 EOF
-    echo -e "${GREEN}Also added ask() to $rc for new terminals.${NC}"
+        echo -e "${GREEN}Added ask() to $rc for new terminals.${NC}"
+    fi
+
+    # Persist NVIDIA_API_KEY in shell rc if currently set (primary provider, no rate limits)
+    if [ -n "${NVIDIA_API_KEY:-}" ] && ! grep -q "NVIDIA_API_KEY" "$rc" 2>/dev/null; then
+        cat >> "$rc" << EOF
+
+# NVIDIA NIM API key (primary provider — production models, no rate limits)
+export NVIDIA_API_KEY="${NVIDIA_API_KEY}"
+EOF
+        echo -e "${GREEN}Persisted NVIDIA_API_KEY to $rc.${NC}"
+    fi
 }
 
 # --------------------------------------------------
@@ -318,23 +327,11 @@ next_steps() {
     echo -e "  → Free models available immediately: opencode/big-pickle, opencode/gpt-5-nano"
     echo ""
 
-    if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -z "${GROQ_API_KEY:-}" ]; then
-        echo -e "${YELLOW}No API keys set — using OpenCode gateway + any env vars found.${NC}"
-        echo ""
-        echo -e "Optionally set keys for more providers:"
-        echo "  export OPENROUTER_API_KEY=\"sk-or-v1-...\""
-        echo "  export GROQ_API_KEY=\"gsk_...\""
-        echo "  export GOOGLE_API_KEY=\"...\""
-        echo "  export NVIDIA_API_KEY=\"nvapi-...\""
-        echo ""
-        echo -e "Add to ${CYAN}~/.bashrc${NC} (or ${CYAN}~/.zshrc${NC}) to persist."
-        echo ""
-        echo "Get free keys:"
-        echo "  https://openrouter.ai/keys"
-        echo "  https://console.groq.com/keys"
-        echo "  https://aistudio.google.com/apikey"
-        echo "  https://build.nvidia.com"
-    fi
+    echo -e "${YELLOW}Recommended: Set your NVIDIA API key (production models, no rate limits)${NC}"
+    echo ""
+    echo -e "  Get a key: ${CYAN}https://build.nvidia.com${NC}"
+    echo ""
+    echo -e "  ${YELLOW}export NVIDIA_API_KEY=\"nvapi-...\"${NC}"
 }
 
 # --------------------------------------------------

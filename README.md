@@ -143,24 +143,25 @@ The coding agent (`--code`) uses text-based tool calling with `<tool_call>` tags
 
 ## Providers
 
-| Provider | Env var | Key required | Models |
-|---|---|---|---|
-| OpenCode Gateway | — | **No** | `big-pickle`, `gpt-5-nano`, `minimax-m2.5-free`, `nemotron-3-super-free` |
-| OpenRouter | `OPENROUTER_API_KEY` | Yes | `deepseek/chat`, `gemini-2.0-flash`, `llama-4-maverick`, `qwen3`, `mistral-small`, `phi-4`, `gemma-4`, `owl-alpha` |
-| Groq | `GROQ_API_KEY` | Yes | `llama-3.3-70b`, `mixtral-8x7b`, `llama-3.1-8b` |
-| Google Gemini | `GOOGLE_API_KEY` | Yes | `gemini-1.5-flash`, `gemini-2.0-flash-lite` |
-| NVIDIA NIM | `NVIDIA_API_KEY` | Yes | `nemotron-3-super`, `meta/llama-3.1-8b-instruct` |
+| Provider | Env var | Key required | Models | Rate limits |
+|---|---|---|---|---|
+| **NVIDIA NIM** ⭐ | `NVIDIA_API_KEY` | Yes | `deepseek-ai/deepseek-v4-pro`, `mistralai/mistral-small-4-119b-2603`, `meta/llama-3.1-8b-instruct` | **1000+ RPM** (no 429s) |
+| Groq | `GROQ_API_KEY` | Yes | `llama-3.3-70b-versatile` | 30 RPM (free tier) |
+| OpenRouter | `OPENROUTER_API_KEY` | Yes | `:free` models from 5 providers | 1-5 RPM (free tier) |
+| OpenCode Gateway | — | **No** | `big-pickle`, `gpt-5-nano` | varies |
 
-The OpenCode gateway runs locally on `http://127.0.0.1:8083` and needs no API key. The setup script installs it automatically and creates a systemd/launchd service for autostart.
+> **⭐ NVIDIA NIM is the recommended primary provider.** Production models with 1000+ RPM rate limits mean you will **never** see HTTP 429 errors. Get a free key at [build.nvidia.com](https://build.nvidia.com).
+
+The agent fires requests to all configured providers simultaneously via `FuturesUnordered` — the first valid response wins. With `NVIDIA_API_KEY` set, NVIDIA production models typically respond in 5-8 seconds with zero rate limit issues.
 
 ### Getting API keys
 
-| Provider | Where to get |
-|---|---|
-| OpenRouter | [openrouter.ai/keys](https://openrouter.ai/keys) |
-| Groq | [console.groq.com/keys](https://console.groq.com/keys) |
-| Google Gemini | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
-| NVIDIA NIM | [build.nvidia.com](https://build.nvidia.com) |
+| Provider | Where to get | Recommended? |
+|---|---|---|
+| **NVIDIA NIM** | [build.nvidia.com](https://build.nvidia.com) | **✅ Primary (no rate limits)** |
+| Groq | [console.groq.com/keys](https://console.groq.com/keys) | Optional fallback |
+| OpenRouter | [openrouter.ai/keys](https://openrouter.ai/keys) | Optional fallback |
+| OpenCode Gateway | Built-in, no key needed | Zero-config free tier |
 
 Keys are **never** stored in source code — only read from environment variables at runtime.
 

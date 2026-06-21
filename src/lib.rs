@@ -138,6 +138,14 @@ static GROQ_MODELS: &[&str] = &[
     "llama-3.3-70b-versatile",
 ];
 
+/// Production models via NVIDIA NIM API — same as Python agent uses.
+/// These have 1000+ RPM rate limits (no 429s in practice).
+static NVIDIA_MODELS: &[&str] = &[
+    "meta/llama-3.1-8b-instruct",
+    "deepseek-ai/deepseek-v4-pro",
+    "mistralai/mistral-small-4-119b-2603",
+];
+
 /// Returns the OpenRouter API key from the `OPENROUTER_API_KEY` env var, or an empty string if unset.
 pub fn get_openrouter_key() -> String {
     std::env::var("OPENROUTER_API_KEY").unwrap_or_default()
@@ -160,6 +168,11 @@ pub fn get_models() -> &'static Vec<String> {
 pub fn get_groq_key() -> Result<String, String> {
     std::env::var("GROQ_API_KEY")
         .map_err(|_| "GROQ_API_KEY not set".to_string())
+}
+
+/// Returns the NVIDIA NIM API key from the `NVIDIA_API_KEY` env var.
+pub fn get_nvidia_key() -> String {
+    std::env::var("NVIDIA_API_KEY").unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +308,33 @@ pub async fn call_groq(
     call_api(
         client,
         "https://api.groq.com/openai/v1/chat/completions",
+        move |r| r.header("Authorization", format!("Bearer {}", api_key)),
+        model,
+        messages,
+        temperature,
+        max_tokens,
+        tools,
+        tool_choice,
+    )
+    .await
+}
+
+/// Calls the NVIDIA NIM API for a single model.
+///
+/// Uses the same OpenAI-compatible endpoint as the Python agent.
+pub async fn call_nvidia(
+    client: &Client,
+    api_key: String,
+    model: &str,
+    messages: &[ChatMessage],
+    temperature: f32,
+    max_tokens: u32,
+    tools: Option<Vec<Tool>>,
+    tool_choice: Option<ToolChoice>,
+) -> Result<ChatMessage, ApiError> {
+    call_api(
+        client,
+        "https://integrate.api.nvidia.com/v1/chat/completions",
         move |r| r.header("Authorization", format!("Bearer {}", api_key)),
         model,
         messages,
@@ -838,16 +878,7 @@ fn chat_system_prompt() -> &'static str {
 static RATE_LIMIT_COOLDOWNS: LazyLock<std::sync::Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-const RATE_LIMIT_COOLDOWN_SECS: u64 = 15;
-
-/// Returns true if `model` is currently in rate-limit cooldown.
-fn is_model_on_cooldown(model: &str) -> bool {
-    let map = RATE_LIMIT_COOLDOWNS.lock().unwrap();
-    match map.get(model) {
-        Some(until) if *until > Instant::now() => true,
-        _ => false,
-    }
-}
+const RATE_LIMIT_COOLDOWN_SECS: u64 = 5;
 
 /// Marks `model` as rate-limited for `RATE_LIMIT_COOLDOWN_SECS`.
 fn mark_model_rate_limited(model: &str) {
@@ -877,24 +908,18 @@ fn jitter_ms(base_ms: u64) -> u64 {
 ///
 /// Uses exponential backoff with jitter and a global cooldown tracker.
 /// On 429, backs off then tries different models instead of exhausting retries on one.
-pub(crate) async fn try_model<F, Fut>(f: F, model: &str, delay_ms: u64) -> (Option<ChatMessage>, String)
+pub(crate) async fn try_model<F, Fut>(f: F, model: &str, delay_ms: u64, timeout_secs: u64) -> (Option<ChatMessage>, String)
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<ChatMessage, ApiError>>,
 {
-    // Skip immediately if model is in cooldown
-    if is_model_on_cooldown(model) {
-        return (None, format!("{}: Skipped (rate-limit cooldown)", model));
-    }
-
-    const REQUEST_TIMEOUT_SECS: u64 = 5;
-    // 429 retries: fast backoff — only retry 2 times before falling through.
-    const MAX_429_RETRIES: u32 = 2;
+    // 429 retries: exponential backoff with jitter.
+    const MAX_429_RETRIES: u32 = 3;
 
     let mut last_err = String::new();
     let mut consecutive_429s = 0u32;
     for _ in 0..(MAX_429_RETRIES + 1) {
-        let res = timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), f()).await;
+        let res = timeout(Duration::from_secs(timeout_secs), f()).await;
         match res {
             Ok(Ok(msg)) => {
                 return (Some(msg), String::new());
@@ -915,7 +940,7 @@ where
                 break;
             }
             Err(_) => {
-                last_err = format!("{}: Timeout ({}s)", model, REQUEST_TIMEOUT_SECS);
+                last_err = format!("{}: Timeout ({}s)", model, timeout_secs);
                 break;
             }
         }
@@ -965,10 +990,9 @@ pub async fn process_query(
     let ak = get_openrouter_key();
     let gk = get_groq_key();
     let gk_val = gk.clone().unwrap_or_default();
-    let no_keys = ak.is_empty() && gk.is_err();
+    let nk = get_nvidia_key();
+    let no_keys = ak.is_empty() && gk.is_err() && nk.is_empty();
 
-    let mut retries = 0u32;
-    loop {
     push_conversation(user_msg.clone()).await;
     let mut attempts: Vec<String> = Vec::new();
 
@@ -981,6 +1005,30 @@ pub async fn process_query(
         use futures_util::StreamExt;
         // Type-erase via Pin<Box<dyn Future>> so different async blocks are compatible
         let mut futs: FuturesUnordered<std::pin::Pin<Box<dyn std::future::Future<Output = (Option<String>, String)> + Send>>> = FuturesUnordered::new();
+        // Add NVIDIA NIM models (production-grade, no rate limits — same as Python agent)
+        if !nk.is_empty() {
+            for model in NVIDIA_MODELS {
+                let model_s = model.to_string();
+                let nk_c = nk.clone();
+                let mv = Arc::clone(&msg_vec);
+                futs.push(Box::pin(async move {
+                    let (msg, err) = try_model(
+                        || call_nvidia(client, nk_c.clone(), &model_s, &mv, effective_temp, max_tokens, None, None),
+                        &model_s,
+                        1000,
+                        12,  // NVIDIA NIM is slower but reliable, give it 12s
+                    ).await;
+                    if let Some(m) = msg {
+                        let text = m.content.unwrap_or_default();
+                        if !text.trim().is_empty() {
+                            let processed = post_process_response(&text);
+                            return (Some(processed), String::new());
+                        }
+                    }
+                    (None, err)
+                }));
+            }
+        }
         // Add Groq model
         if !gk_val.is_empty() {
             for model in GROQ_MODELS {
@@ -992,6 +1040,7 @@ pub async fn process_query(
                         || call_groq(client, gk.clone(), &model_s, &mv, effective_temp, max_tokens, None, None),
                         &model_s,
                         1000,
+                        4,  // Groq is fast, timeout rapidly
                     ).await;
                     if let Some(m) = msg {
                         let text = m.content.unwrap_or_default();
@@ -1016,6 +1065,7 @@ pub async fn process_query(
                         || call_openrouter(client, ak_c.clone(), &model_s, &mv, effective_temp, max_tokens, None, None),
                         &model_s,
                         1000,
+                        4,  // OpenRouter free models are slow/unreliable, timeout rapidly
                     ).await;
                     if let Some(m) = msg {
                         let text = m.content.unwrap_or_default();
@@ -1054,33 +1104,18 @@ pub async fn process_query(
         return;
     }
 
-    // All failed — check if all were rate-limit or transient issues, then auto-retry once
-    let all_rate_limited = attempts.iter().all(|a| {
-        a.contains("Rate limited") || a.contains("cooldown") || a.contains("Skipped")
-            || a.contains("Timeout")
-    });
-
     CONVERSATION.write().await.pop_back();
 
-    if all_rate_limited && !no_keys && retries < 1 {
-        retries += 1;
-        eprintln!("{}", "All models rate-limited. Waiting 10s and retrying...".yellow());
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        continue;
-    }
-
-    eprintln!("{}", "All free models failed.".red());
+    eprintln!("{}", "All models failed.".red());
     for a in &attempts {
         eprintln!("  {} {}", "•".yellow(), a.cyan());
     }
     if no_keys {
         eprintln!(
             "{}",
-            "No API keys set. Export OPENROUTER_API_KEY or GROQ_API_KEY."
+            "No API keys set. Export NVIDIA_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY."
                 .yellow()
         );
-    }
-    break;
     }
 }
 
@@ -1150,6 +1185,7 @@ pub async fn process_code_query(
     let ak = get_openrouter_key();
     let gk = get_groq_key();
     let gk_val = gk.clone().unwrap_or_default();
+    let nk = get_nvidia_key();
     let system_prompt = coding_system_prompt();
 
     let system_msg = ChatMessage {
@@ -1221,7 +1257,33 @@ pub async fn process_code_query(
 
         let mut attempts: Vec<String> = Vec::new();
 
-        // Try Groq and first OpenRouter model CONCURRENTLY for lower latency
+        // Try NVIDIA, Groq, and first OpenRouter model CONCURRENTLY
+        let nv_fut = async {
+            if nk.is_empty() {
+                return (None::<ChatMessage>, Vec::new());
+            }
+            let mut att = Vec::new();
+            for model in NVIDIA_MODELS {
+                let (msg, err) = try_model(
+                    || call_nvidia(client, nk.clone(), model, &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone()),
+                    model, 1000, 12,
+                ).await;
+                if let Some(m) = msg {
+                    if m.tool_calls.is_some() || tc_re.is_match(&m.content.as_deref().unwrap_or("")) {
+                        return (Some(m), att);
+                    }
+                    let text = m.content.as_deref().unwrap_or("");
+                    let score = score_response(text);
+                    if score > 0.0 {
+                        return (Some(m), att);
+                    }
+                    att.push(format!("{}: low quality (score {:.0})", model, score));
+                } else {
+                    att.push(err);
+                }
+            }
+            (None::<ChatMessage>, att)
+        };
         let groq_fut = async {
             if gk_val.is_empty() {
                 return (None::<ChatMessage>, Vec::new());
@@ -1230,7 +1292,7 @@ pub async fn process_code_query(
             for model in GROQ_MODELS {
                 let (msg, err) = try_model(
                     || call_groq(client, gk_val.clone(), model, &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone()),
-                    model, 1000,
+                    model, 1000, 4,
                 ).await;
                 if let Some(m) = msg {
                     if m.tool_calls.is_some() || tc_re.is_match(&m.content.as_deref().unwrap_or("")) {
@@ -1259,7 +1321,7 @@ pub async fn process_code_query(
             let mut att = Vec::new();
             let (msg, err) = try_model(
                 || call_openrouter(client, ak.clone(), &models[0], &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone()),
-                &models[0], 1000,
+                &models[0], 1000, 4,
             ).await;
             if let Some(m) = msg {
                 if m.tool_calls.is_some() || tc_re.is_match(&m.content.as_deref().unwrap_or("")) {
@@ -1276,12 +1338,13 @@ pub async fn process_code_query(
             }
             (None::<ChatMessage>, att)
         };
-        let ((groq_resp, groq_att), (or_resp, or_att)) = tokio::join!(groq_fut, or_fut);
+        let ((nv_resp, nv_att), (groq_resp, groq_att), (or_resp, or_att)) = tokio::join!(nv_fut, groq_fut, or_fut);
+        attempts.extend(nv_att);
         attempts.extend(groq_att);
         attempts.extend(or_att);
 
-        // Pick Groq response if both succeeded (Groq is cheaper/faster)
-        let mut response_msg = groq_resp.or(or_resp);
+        // Pick NVIDIA response first (production-grade, no rate limits), then Groq
+        let mut response_msg = nv_resp.or(groq_resp).or(or_resp);
 
         // Try remaining OpenRouter models CONCURRENTLY (join_all)
         if response_msg.is_none() && !ak.is_empty() {
@@ -1294,6 +1357,7 @@ pub async fn process_code_query(
                         || call_openrouter(client, ak.clone(), model, &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone()),
                         model,
                         1000,
+                        4,
                     )
                 }).collect();
                 let results = join_all(futs).await;

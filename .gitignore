@@ -4,3 +4,8 @@
 *~
 .DS_Store
 lvm-lab.md
+
+# Local IDE/agent config
+.qwen/
+# Response cache
+.tell_cache.json

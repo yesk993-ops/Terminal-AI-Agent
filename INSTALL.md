@@ -22,9 +22,11 @@ The script will:
 
 After it finishes, set your API key and you're done:
 ```bash
-export OPENROUTER_API_KEY="sk-or-v1-..."
-terminal_ai_agent "What is Rust?"
+export NVIDIA_API_KEY="nvapi-..."
+ask "What is Rust?"
 ```
+
+> **💡 NVIDIA NIM is the recommended primary provider** — production models with 1000+ RPM rate limits (no 429s). Get a free key at [build.nvidia.com](https://build.nvidia.com).
 
 ---
 
@@ -122,24 +124,35 @@ Copy-Item .\target\release\terminal_ai_agent.exe C:\Windows\System32\
 This agent **never** stores API keys in source code. All keys are read from
 environment variables at runtime.
 
-### OpenRouter (recommended primary)
-1. Sign up at [openrouter.ai](https://openrouter.ai/keys).
-2. Create an API key.
+### NVIDIA NIM (recommended primary — no rate limits)
+1. Sign up at [build.nvidia.com](https://build.nvidia.com).
+2. Generate an API key (starts with `nvapi-`).
 3. Export it in your shell profile:
 
 **Linux / macOS** (`~/.bashrc`, `~/.zshrc`, or `~/.profile`)
 ```bash
-export OPENROUTER_API_KEY="sk-or-v1-xxxxxxxxxxxxxxxx"
+export NVIDIA_API_KEY="nvapi-xxxxxxxxxxxxxxxx"
 ```
 
 **Windows PowerShell** (`$PROFILE`)
 ```powershell
-$env:OPENROUTER_API_KEY = "sk-or-v1-xxxxxxxxxxxxxxxx"
+$env:NVIDIA_API_KEY = "nvapi-xxxxxxxxxxxxxxxx"
 # Persist for future sessions:
-[Environment]::SetEnvironmentVariable("OPENROUTER_API_KEY", "sk-or-v1-xxxxxxxxxxxxxxxx", "User")
+[Environment]::SetEnvironmentVariable("NVIDIA_API_KEY", "nvapi-xxxxxxxxxxxxxxxx", "User")
 ```
 
-### Groq (optional fallback — faster, free)
+> NVIDIA NIM uses production-grade models (`deepseek-ai/deepseek-v4-pro`, `mistralai/mistral-small-4-119b-2603`) with 1000+ RPM rate limits. You will **never** see HTTP 429 errors with NVIDIA.
+
+### OpenRouter (optional fallback)
+1. Sign up at [openrouter.ai](https://openrouter.ai/keys).
+2. Create an API key.
+3. Export it:
+
+```bash
+export OPENROUTER_API_KEY="sk-or-v1-xxxxxxxxxxxxxxxx"
+```
+
+### Groq (optional fallback — fastest, free)
 1. Sign up at [console.groq.com/keys](https://console.groq.com/keys).
 2. Create an API key.
 3. Export it:
@@ -148,9 +161,9 @@ $env:OPENROUTER_API_KEY = "sk-or-v1-xxxxxxxxxxxxxxxx"
 export GROQ_API_KEY="gsk_xxxxxxxxxxxxxxxx"
 ```
 
-The agent tries OpenRouter first, then Groq in parallel. The fastest response
-wins. If only `GROQ_API_KEY` is set (no `OPENROUTER_API_KEY`), it falls back
-to Groq automatically.
+The agent tries all configured providers simultaneously via FuturesUnordered —
+the first valid response wins. With `NVIDIA_API_KEY` set, NVIDIA production
+models respond first (no rate limits). Groq and OpenRouter act as fallbacks.
 
 ---
 
@@ -212,9 +225,9 @@ rm -rf Terminal-AI-Agent
 
 | Problem | Solution |
 |---|---|
-| `OPENROUTER_API_KEY not set` | Export the env var (see API Keys section above) |
-| `All free models failed. Timeout` | Check your internet or try with `--temp 0.5` |
+| `NVIDIA_API_KEY not set` | Export the env var (see API Keys section above) |
+| `All models failed. Timeout` | Check your internet or try with `--temp 0.5` |
 | `HTTP 401 (Unauthorized)` | Your API key is invalid — regenerate it |
-| `HTTP 429 (Rate limited)` | Wait a minute and try again |
+| `HTTP 429 (Rate limited)` | Set `NVIDIA_API_KEY` — NVIDIA NIM has no rate limits |
 | `openssl-sys build failed` | Install `libssl-dev` (Linux) or Xcode CLT (macOS) |
 | No colored output | Ensure your terminal supports ANSI escape codes (most do) |
