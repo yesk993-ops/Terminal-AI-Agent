@@ -673,8 +673,9 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
         }
         out.push('\n');
 
-        // Separator after header
-        if has_header && row_idx == 0 {
+        // Add separator line after every row except the last
+        // This gives each row its own bordered cell with solid lines on all sides
+        if row_idx < parsed_rows.len() - 1 {
             out.push_str(&format!("\x1b[36m{}\x1b[0m\n", hrule("├", "┼", "┤")));
         }
     }
@@ -896,7 +897,7 @@ fn score_response(resp: &str) -> f64 {
         50.0 - ((len - 3000.0) / 3000.0 * 20.0).min(20.0)
     };
 
-    // Structure score: headings, lists, code blocks, bold text
+    // Structure score: headings, lists, code blocks, bold text, tables
     let mut structure = 0.0;
     if resp.contains("### ") || resp.contains("## ") {
         structure += 15.0;
@@ -909,6 +910,11 @@ fn score_response(resp: &str) -> f64 {
     }
     if resp.contains("**") {
         structure += 5.0;
+    }
+    // Bonus for markdown tables — detect the separator row (| --- |) which is
+    // a strong signal the model used structured comparison formatting
+    if resp.lines().any(|l| l.trim().starts_with('|') && l.contains("---")) {
+        structure += 15.0;
     }
     if lines > 3.0 {
         structure += 5.0;
@@ -1042,7 +1048,6 @@ fn chat_system_prompt() -> &'static str {
 ## Response quality
 - Lead with the direct answer, then explain if needed
 - Use concrete examples, numbers, and specific facts — avoid vague generalities
-- When comparing things, use a table or bullet points
 - For technical topics, include code examples where relevant
 - Keep responses focused — answer what was asked, nothing extra
 
@@ -1053,6 +1058,15 @@ fn chat_system_prompt() -> &'static str {
 - Use triple-backtick code blocks for multi-line code, configs, or shell commands
 - Use - bullet points for lists of 3+ items
 - Use numbered lists for sequential steps
+
+## Tables (CRITICAL — used for all comparisons, tabular data, and structured points)
+- ALL comparisons, feature comparisons, pricing, specifications, pros/cons, metrics, or any multi-column data MUST use markdown table format with pipes:
+  | Header 1 | Header 2 | Header 3 |
+  |----------|----------|----------|
+  | Cell 1   | Cell 2   | Cell 3   |
+- This includes: comparing tools, products, versions, languages, frameworks, providers, plans, features, benchmarks, and any structured points
+- Do NOT use loose column alignment or plain text lists for comparison data — always use a proper markdown table
+- Tables are rendered as beautiful box-drawing grids with borders on all sides
 
 ## Personality
 - Be direct and confident — don't hedge with hedging phrases
@@ -2027,11 +2041,11 @@ mod tests {
         let result = format_table_rows(&rows, 80);
         assert!(result.contains("x"));
         assert!(result.contains("y"));
-        // No separator row means no header styling for first row...
-        // Actually all rows get data color since there's no separator
+        // All rows get data color since there's no separator row
         assert!(result.contains("┌"));
         assert!(result.contains("└"));
-        assert!(!result.contains("├"));  // No header separator
+        // Now has a separator between the two rows (full grid on all sides)
+        assert!(result.contains("├"));
     }
 
     #[test]
