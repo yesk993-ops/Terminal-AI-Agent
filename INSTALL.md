@@ -141,7 +141,22 @@ $env:NVIDIA_API_KEY = "nvapi-xxxxxxxxxxxxxxxx"
 [Environment]::SetEnvironmentVariable("NVIDIA_API_KEY", "nvapi-xxxxxxxxxxxxxxxx", "User")
 ```
 
-> NVIDIA NIM uses production-grade models (`deepseek-ai/deepseek-v4-pro`, `mistralai/mistral-small-4-119b-2603`) with 1000+ RPM rate limits. You will **never** see HTTP 429 errors with NVIDIA.
+> NVIDIA NIM uses production-grade models (`deepseek-ai/deepseek-v4-pro`, `mistralai/mistral-small-4-119b-2603`) hosted on NVIDIA's own infrastructure. With **1000+ requests per minute** rate limits, you will **never** see HTTP 429 errors. This is the same API provider used by the Python-based `tell` agent, which operates without any rate limit issues.
+
+#### Why NVIDIA has no rate limits vs free-tier providers
+
+| Provider | Tier | Rate Limit | Typical 429 behavior |
+|---|---|---|---|
+| **NVIDIA NIM** ⭐ | Production | **1000+ RPM** | Never hits limits under normal use |
+| Groq | Free | **30 RPM** | Hits limits after 1-2 queries in quick succession |
+| OpenRouter `:free` models | Free | **1-5 RPM** per model | Hits limits immediately on any load |
+
+NVIDIA NIM is a **paid production API** (with a generous free allocation) that NVIDIA hosts on its own DGX infrastructure. The rate limits are high enough that you can fire 10+ queries per second without ever getting a 429. In contrast:
+
+- **Groq free tier** limits `llama-3.3-70b-versatile` to 30 requests per minute. After just 2-3 rapid queries, you'll get rate-limited for ~60 seconds.
+- **OpenRouter `:free` models** (like `google/gemma-4-31b-it:free`, `qwen/qwen3-coder:free`) limit each model to **1-5 RPM** and often block concurrent requests entirely. The `:free` suffix means OpenRouter prioritizes paid users, so free requests are aggressively throttled.
+
+**Bottom line:** Set `NVIDIA_API_KEY` and you'll never see "All models failed" or "Rate limited" errors again. Groq and OpenRouter are only useful as emergency fallbacks when no NVIDIA key is configured.
 
 ### OpenRouter (optional fallback)
 1. Sign up at [openrouter.ai](https://openrouter.ai/keys).

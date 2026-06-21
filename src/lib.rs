@@ -522,9 +522,173 @@ fn acronym_re() -> &'static Regex {
     &RE
 }
 
+// ---------------------------------------------------------------------------
+// Markdown table formatting
+// ---------------------------------------------------------------------------
+
+/// Detects if a line is a markdown table row (starts/ends with `|`, has at least 2 columns).
+fn is_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed[1..].trim_end_matches('|').contains('|')
+}
+
+/// Detects if a line is a markdown table separator row (contains `---` between pipes).
+fn is_table_separator(line: &str) -> bool {
+    line.trim().starts_with('|') && line.contains("---")
+}
+
+/// Parses cells from a markdown table row, trimming whitespace.
+fn parse_table_cells(line: &str) -> Vec<String> {
+    line.trim()
+        .trim_start_matches('|')
+        .trim_end_matches('|')
+        .split('|')
+        .map(|s| s.trim().to_string())
+        .collect()
+}
+
+/// Formats a block of consecutive markdown table rows into a box-drawing table
+/// with ANSI colors. Header row gets bold bright yellow, data rows get green.
+fn format_table_rows(rows: &[&str], term_w: usize) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    // Parse all rows, skipping the separator
+    let mut parsed_rows: Vec<Vec<String>> = Vec::new();
+    let mut has_header = false;
+
+    for row in rows {
+        let trimmed = row.trim();
+        if is_table_separator(trimmed) {
+            has_header = true;
+            continue;
+        }
+        let cells = parse_table_cells(trimmed);
+        if !cells.is_empty() {
+            parsed_rows.push(cells);
+        }
+    }
+
+    if parsed_rows.is_empty() {
+        return String::new();
+    }
+
+    // Determine column count (max across all rows for ragged tables)
+    let col_count = parsed_rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if col_count == 0 {
+        return String::new();
+    }
+
+    // Pad rows to equal column count
+    for row in &mut parsed_rows {
+        while row.len() < col_count {
+            row.push(String::new());
+        }
+    }
+
+    // Calculate column widths
+    let mut col_widths = vec![0usize; col_count];
+    for row in &parsed_rows {
+        for (i, cell) in row.iter().enumerate() {
+            let visual_len = cell.chars().count();
+            if visual_len > col_widths[i] {
+                col_widths[i] = visual_len;
+            }
+        }
+    }
+
+    // Cap total width to terminal width
+    let padding_total = col_count * 3 + 1; // `| ` + ` | ` + `|`  → 3 chars per col + 1 for leading `|`
+    let total_content: usize = col_widths.iter().sum();
+    let total_width = total_content + padding_total;
+    if total_width > term_w && total_content > 0 {
+        let available = term_w.saturating_sub(padding_total).max(col_count * 3);
+        let ratio = available as f64 / total_content as f64;
+        if ratio < 1.0 {
+            for w in &mut col_widths {
+                *w = (*w as f64 * ratio).max(3.0) as usize;
+            }
+        }
+    }
+
+    let a_re = ansi_re();
+    let ic_re = inline_code_re();
+    let b_re = bold_re();
+
+    // Helper: render a cell with ANSI formatting and padding
+    let format_cell = |cell: &str, width: usize, is_header: bool| -> String {
+        // Apply inline formatting (bold, inline code) within cell
+        let mut processed = ic_re
+            .replace_all(cell, |caps: &regex::Captures| {
+                format!("\x1b[0;32m{}\x1b[0m", &caps[1])
+            })
+            .to_string();
+        {
+            let bold_color = if is_header { "93" } else { "92" };
+            processed = b_re
+                .replace_all(&processed, |caps: &regex::Captures| {
+                    format!("\x1b[1;3;4;{}m{}\x1b[0m", bold_color, &caps[1])
+                })
+                .to_string();
+        }
+
+        // Strip any existing ANSI for width calculation, pad, then re-apply color
+        let stripped = a_re.replace_all(&processed, "").to_string();
+        let pad = width.saturating_sub(stripped.chars().count());
+        let padded = format!(" {} {:pad$} ", processed, "", pad = pad);
+
+        if is_header {
+            format!("\x1b[1;93m{}\x1b[0m", padded)
+        } else {
+            format!("\x1b[0;92m{}\x1b[0m", padded)
+        }
+    };
+
+    // Helper: build a horizontal rule
+    let hrule = |left: &str, mid: &str, right: &str| -> String {
+        let mut s = String::from(left);
+        for (i, w) in col_widths.iter().enumerate() {
+            s.push_str(&"─".repeat(*w + 2));
+            if i < col_count - 1 {
+                s.push_str(mid);
+            }
+        }
+        s.push_str(right);
+        s
+    };
+
+    let mut out = String::new();
+
+    // Top border
+    out.push_str(&format!("\x1b[36m{}\x1b[0m\n", hrule("┌", "┬", "┐")));
+
+    for (row_idx, row) in parsed_rows.iter().enumerate() {
+        // Data row
+        out.push('│');
+        for (i, cell) in row.iter().enumerate() {
+            let rendered = format_cell(cell, col_widths[i], has_header && row_idx == 0);
+            out.push_str(&rendered);
+            out.push('│');
+        }
+        out.push('\n');
+
+        // Separator after header
+        if has_header && row_idx == 0 {
+            out.push_str(&format!("\x1b[36m{}\x1b[0m\n", hrule("├", "┼", "┤")));
+        }
+    }
+
+    // Bottom border
+    out.push_str(&format!("\x1b[36m{}\x1b[0m", hrule("└", "┴", "┘")));
+
+    out
+}
+
 /// Renders a model response into a bordered string with ANSI color codes.
 ///
 /// * Strips markdown formatting (`**bold**`, `### headings`, `` `inline code` ``, `* list`)
+/// * Converts markdown tables into box-drawing tables with proper column alignment
 /// * Applies colors: bold green for key terms, green for headings,
 ///   gold for acronym definitions (e.g. `SLA (Service Level Agreement)`),
 ///   green for code blocks and inline commands
@@ -542,10 +706,31 @@ pub fn format_response(resp: &str) -> String {
     let ac_re = acronym_re();
     let a_re = ansi_re();
     let mut in_code = false;
+    // Buffer for table rows (markdown tables are consecutive |...| lines)
+    let mut table_buf: Vec<&str> = Vec::new();
+
+    /// Flush any buffered table rows into `lines` as individual padded lines.
+    fn flush_table(table_buf: &mut Vec<&str>, lines: &mut Vec<String>, term_w: usize) {
+        if table_buf.is_empty() {
+            return;
+        }
+        let table = format_table_rows(table_buf, term_w);
+        if !table.is_empty() {
+            // Split multi-line table into individual lines so the final padding loop
+            // handles each line correctly
+            for tbl_line in table.lines() {
+                lines.push(tbl_line.to_string());
+            }
+        }
+        table_buf.clear();
+    }
 
     for raw_line in resp.lines() {
         let trimmed = raw_line.trim();
+
+        // Detect code fences
         if trimmed.starts_with("```") {
+            flush_table(&mut table_buf, &mut lines, term_w);
             in_code = !in_code;
             continue;
         }
@@ -558,6 +743,15 @@ pub fn format_response(resp: &str) -> String {
             lines.extend(wrapped);
             continue;
         }
+
+        // Detect markdown table rows
+        if is_table_row(trimmed) {
+            table_buf.push(trimmed);
+            continue;
+        }
+
+        // If we were building a table and this line isn't a table row, flush
+        flush_table(&mut table_buf, &mut lines, term_w);
 
         let is_heading = trimmed.starts_with("### ")
             || trimmed.starts_with("## ")
@@ -605,6 +799,9 @@ pub fn format_response(resp: &str) -> String {
             lines.push(processed);
         }
     }
+
+    // Flush any remaining table buffer at end of input
+    flush_table(&mut table_buf, &mut lines, term_w);
 
     if lines.is_empty() {
         lines.push(String::new());
@@ -1754,6 +1951,112 @@ mod tests {
         let result = post_process_response(resp);
         // Should collapse 6 blank lines down to 2
         assert!(!result.contains("\n\n\n\n"));
+    }
+
+    // -- table formatting tests --
+
+    #[test]
+    fn test_is_table_row_valid() {
+        assert!(is_table_row("| a | b |"));
+        assert!(is_table_row("|a|b|c|"));
+        assert!(is_table_row("| **Bold** | `code` |"));
+        assert!(is_table_row("|---|---|---|"));
+        assert!(is_table_row("|:---|:---:|---:|"));
+    }
+
+    #[test]
+    fn test_is_table_row_invalid() {
+        assert!(!is_table_row("not a table"));
+        assert!(!is_table_row("| just one pipe"));
+        assert!(!is_table_row("this is | also not"));
+        assert!(!is_table_row("|single_pipe|"));
+    }
+
+    #[test]
+    fn test_is_table_separator() {
+        assert!(is_table_separator("|---|---|---|"));
+        assert!(is_table_separator("|:---|:---:|---:|"));
+        assert!(!is_table_separator("| a | b | c |"));
+    }
+
+    #[test]
+    fn test_parse_table_cells() {
+        let cells = parse_table_cells("| a | bbb | cc |");
+        assert_eq!(cells, vec!["a", "bbb", "cc"]);
+    }
+
+    #[test]
+    fn test_parse_table_cells_no_spaces() {
+        let cells = parse_table_cells("|a|b|c|");
+        assert_eq!(cells, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_format_table_rows_basic() {
+        let rows = vec![
+            "| Name  | Age |",
+            "|-------|-----|",
+            "| Alice | 30  |",
+            "| Bob   | 25  |",
+        ];
+        let result = format_table_rows(&rows, 80);
+        assert!(result.contains("Alice"));
+        assert!(result.contains("Bob"));
+        assert!(result.contains("Name"));
+        assert!(result.contains("Age"));
+        // Box-drawing characters
+        assert!(result.contains("┌"));
+        assert!(result.contains("┐"));
+        assert!(result.contains("├"));
+        assert!(result.contains("┤"));
+        assert!(result.contains("└"));
+        assert!(result.contains("┘"));
+        assert!(result.contains("┴"));
+        // ANSI color codes for header
+        assert!(result.contains("\x1b[1;93m"));
+        // ANSI color codes for data rows
+        assert!(result.contains("\x1b[0;92m"));
+    }
+
+    #[test]
+    fn test_format_table_rows_no_header() {
+        let rows = vec![
+            "| x | y |",
+            "| 1 | 2 |",
+        ];
+        let result = format_table_rows(&rows, 80);
+        assert!(result.contains("x"));
+        assert!(result.contains("y"));
+        // No separator row means no header styling for first row...
+        // Actually all rows get data color since there's no separator
+        assert!(result.contains("┌"));
+        assert!(result.contains("└"));
+        assert!(!result.contains("├"));  // No header separator
+    }
+
+    #[test]
+    fn test_format_table_in_format_response_integration() {
+        let input = "Here's a comparison:\n\n| Provider | RPM |\n|----------|-----|\n| NVIDIA   | 1000+|\n| Groq     | 30   |\n";
+        let result = format_response(input);
+        // Table rendered with box-drawing characters
+        assert!(result.contains("NVIDIA"));
+        assert!(result.contains("Groq"));
+        assert!(result.contains("Provider"));
+        assert!(result.contains("RPM"));
+        // No raw markdown pipes should remain
+        assert!(!result.contains("|---"));
+        // The leading "Here's a comparison:" should still be there
+        assert!(result.contains("Here's a comparison"));
+    }
+
+    #[test]
+    fn test_format_table_with_bold_in_cells() {
+        let input = "| **Name** | Value |\n|----------|-------|\n| **CPU**  | 3.2   |\n";
+        let result = format_response(input);
+        assert!(result.contains("Name"));
+        assert!(result.contains("CPU"));
+        // Bold formatting should have ANSI codes
+        assert!(result.contains("\x1b[1;3;4;92m"));
     }
 
     // -- summarize_old_context tests --
