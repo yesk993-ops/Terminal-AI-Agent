@@ -549,6 +549,7 @@ fn parse_table_cells(line: &str) -> Vec<String> {
 
 /// Formats a block of consecutive markdown table rows into a box-drawing table
 /// with ANSI colors. Header row gets bold bright yellow, data rows get green.
+/// Long cell content is word-wrapped to fit within column widths.
 fn format_table_rows(rows: &[&str], term_w: usize) -> String {
     if rows.is_empty() {
         return String::new();
@@ -587,7 +588,7 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
         }
     }
 
-    // Calculate column widths
+    // Calculate column widths based on content
     let mut col_widths = vec![0usize; col_count];
     for row in &parsed_rows {
         for (i, cell) in row.iter().enumerate() {
@@ -598,16 +599,25 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
         }
     }
 
-    // Cap total width to terminal width
-    let padding_total = col_count * 3 + 1; // `| ` + ` | ` + `|`  → 3 chars per col + 1 for leading `|`
+    // Cap total width to terminal width with smarter proportional distribution
+    let padding_total = col_count * 3 + 1;
     let total_content: usize = col_widths.iter().sum();
     let total_width = total_content + padding_total;
     if total_width > term_w && total_content > 0 {
         let available = term_w.saturating_sub(padding_total).max(col_count * 3);
         let ratio = available as f64 / total_content as f64;
         if ratio < 1.0 {
+            // Wider columns get more space, but all get at least 5
             for w in &mut col_widths {
-                *w = (*w as f64 * ratio).max(3.0) as usize;
+                *w = (*w as f64 * ratio).max(5.0) as usize;
+            }
+            // If still too wide after applying minimums, scale again
+            let new_total: usize = col_widths.iter().sum();
+            if new_total > available {
+                let second_ratio = available as f64 / new_total as f64;
+                for w in &mut col_widths {
+                    *w = (*w as f64 * second_ratio).max(3.0) as usize;
+                }
             }
         }
     }
@@ -616,34 +626,63 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
     let ic_re = inline_code_re();
     let b_re = bold_re();
 
-    // Helper: render a cell with ANSI formatting and padding
-    let format_cell = |cell: &str, width: usize, is_header: bool| -> String {
-        // Apply inline formatting (bold, inline code) within cell
+    // Helper: render a single line of a cell with ANSI formatting and padding
+    let format_cell_line = |line: &str, width: usize, is_header: bool| -> String {
+        // Apply inline formatting (bold, inline code) within this line
         let mut processed = ic_re
-            .replace_all(cell, |caps: &regex::Captures| {
-                format!("\x1b[0;32m{}\x1b[0m", &caps[1])
+            .replace_all(line, |caps: &regex::Captures| {
+                format!("[0;32m{}[0m", &caps[1])
             })
             .to_string();
         {
             let bold_color = if is_header { "93" } else { "92" };
             processed = b_re
                 .replace_all(&processed, |caps: &regex::Captures| {
-                    format!("\x1b[1;3;4;{}m{}\x1b[0m", bold_color, &caps[1])
+                    format!("[1;3;4;{}m{}[0m", bold_color, &caps[1])
                 })
                 .to_string();
         }
 
-        // Strip any existing ANSI for width calculation, pad, then re-apply color
+        // Strip ANSI for width calculation, pad, then re-apply color
         let stripped = a_re.replace_all(&processed, "").to_string();
         let pad = width.saturating_sub(stripped.chars().count());
         let padded = format!(" {} {:pad$} ", processed, "", pad = pad);
 
         if is_header {
-            format!("\x1b[1;93m{}\x1b[0m", padded)
+            format!("[1;93m{}[0m", padded)
         } else {
-            format!("\x1b[0;92m{}\x1b[0m", padded)
+            format!("[0;92m{}[0m", padded)
         }
     };
+
+    // Word-wrap each cell's content to its column width.
+    // wrapped_lines[row_idx][cell_idx] = Vec<String> of wrapped lines (raw text)
+    let mut wrapped_lines: Vec<Vec<Vec<String>>> = Vec::new();
+    let mut row_heights: Vec<usize> = Vec::new();
+
+    for row in &parsed_rows {
+        let mut row_content: Vec<Vec<String>> = Vec::new();
+        let mut max_lines_for_row = 1usize;
+
+        for (i, cell) in row.iter().enumerate() {
+            let col_w = col_widths[i];
+            let lines: Vec<String> = if cell.chars().count() > col_w {
+                wrap(cell, col_w)
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            } else {
+                vec![cell.clone()]
+            };
+            let n = lines.len();
+            if n > max_lines_for_row {
+                max_lines_for_row = n;
+            }
+            row_content.push(lines);
+        }
+        wrapped_lines.push(row_content);
+        row_heights.push(max_lines_for_row);
+    }
 
     // Helper: build a horizontal rule
     let hrule = |left: &str, mid: &str, right: &str| -> String {
@@ -661,30 +700,44 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
     let mut out = String::new();
 
     // Top border
-    out.push_str(&format!("\x1b[36m{}\x1b[0m\n", hrule("┌", "┬", "┐")));
+    out.push_str(&format!("[36m{}[0m
+", hrule("┌", "┬", "┐")));
 
-    for (row_idx, row) in parsed_rows.iter().enumerate() {
-        // Data row
-        out.push('│');
-        for (i, cell) in row.iter().enumerate() {
-            let rendered = format_cell(cell, col_widths[i], has_header && row_idx == 0);
-            out.push_str(&rendered);
+    for (row_idx, _row) in parsed_rows.iter().enumerate() {
+        let row_height = row_heights[row_idx];
+        let is_header = has_header && row_idx == 0;
+
+        // Render each text line of this row (multi-line cells span multiple lines)
+        for line_idx in 0..row_height {
             out.push('│');
+            for cell_idx in 0..col_count {
+                let col_w = col_widths[cell_idx];
+                let cell_lines = &wrapped_lines[row_idx][cell_idx];
+                let cell_text = if line_idx < cell_lines.len() {
+                    &cell_lines[line_idx]
+                } else {
+                    ""
+                };
+                let rendered = format_cell_line(cell_text, col_w, is_header);
+                out.push_str(&rendered);
+                out.push('│');
+            }
+            out.push('\n');
         }
-        out.push('\n');
 
-        // Grid style: separator after every row except the last,
-        // giving every cell borders on all sides for a structured grid appearance
+        // Grid separator after each row except the last
         if row_idx < parsed_rows.len() - 1 {
-            out.push_str(&format!("\x1b[36m{}\x1b[0m\n", hrule("├", "┼", "┤")));
+            out.push_str(&format!("[36m{}[0m
+", hrule("├", "┼", "┤")));
         }
     }
 
     // Bottom border
-    out.push_str(&format!("\x1b[36m{}\x1b[0m", hrule("└", "┴", "┘")));
+    out.push_str(&format!("[36m{}[0m", hrule("└", "┴", "┘")));
 
     out
 }
+
 
 /// Renders a model response into a bordered string with ANSI color codes.
 ///
@@ -2073,7 +2126,117 @@ mod tests {
         assert!(result.contains("\x1b[1;3;4;92m"));
     }
 
-    // -- summarize_old_context tests --
+        // -- demo: before/after table rendering comparison --
+
+    #[test]
+    fn test_demo_word_wrapped_table() {
+        let rows = vec![
+            "| Tool        | Type                    | Key Features                                       | Language Support                  | License                      |",
+            "|------------|------------------------|---------------------------------------------------|----------------------------------|------------------------------|",
+            "| SonarQube   | Static Code Analysis (SAST)  | Detects security bugs, code smells, and vulnerabilities  | Java, C#, JavaScript, Python, etc.  | LGPL-3.0                     |",
+            "| Semgrep     | Static Analysis (SAST)  | Lightweight, customizable rules, supports 15+ languages  | Python, Java, Go, JavaScript, etc.  | LGPL-3.0                     |",
+            "| CodeQL      | Static Analysis (SAST)  | Deep semantic analysis, GitHub-native              | C/C++, Java, JavaScript, Python, etc.  | OWTFPL                       |",
+            "| Bandit      | Python-specific SAST    | Focuses on Python security issues (SQLi, XSS, etc.)  | Python                            | Apache-2.0                   |",
+            "| Gosec       | Go-specific SAST        | Scans Go code for security flaws                   | Go                                | Apache-2.0                   |",
+            "| Trivy       | Container & Code Scanning  | Scans containers, filesystems, and repos for vulnerabilities  | Multi-language (via dependency scanning)  | Apache-2.0                   |",
+            "| Snyk Code   | SAST + SCA              | Detects vulnerabilities in open-source dependencies  | JavaScript, Python, Java, etc.    | Proprietary (free tier available)  |",
+        ];
+
+        // ── OLD BEHAVIOR (simulated: no word wrapping, uniform scaling) ──
+        let old_result = format_table_rows_old(&rows, 80);
+        eprintln!("\nBefore (old rendering, no word wrapping):");
+        for line in old_result.lines() {
+            let clean = ansi_re().replace_all(line, "");
+            eprintln!("{}", clean);
+        }
+
+        // ── NEW BEHAVIOR (word wrapping, proportional widths) ──
+        let new_result = format_table_rows(&rows, 80);
+        eprintln!("\nAfter (new rendering, with word wrapping):");
+        for line in new_result.lines() {
+            let clean = ansi_re().replace_all(line, "");
+            eprintln!("{}", clean);
+        }
+        eprintln!();
+
+        assert!(new_result.contains("Sonar"), "New: should contain wrapped content");
+        assert!(new_result.contains("Detects"), "New: wrapped text present");
+        assert!(new_result.contains("vulnerabilities"), "New: long text wrapped");
+        assert!(old_result.contains("┌"), "Old: should have top border");
+    }
+
+    /// Old-style rendering: no word wrapping, uniform scaling, single-line cells
+    fn format_table_rows_old(rows: &[&str], term_w: usize) -> String {
+        if rows.is_empty() { return String::new(); }
+        let mut parsed_rows: Vec<Vec<String>> = Vec::new();
+        let mut has_header = false;
+        for row in rows {
+            let trimmed = row.trim();
+            if is_table_separator(trimmed) { has_header = true; continue; }
+            let cells = parse_table_cells(trimmed);
+            if !cells.is_empty() { parsed_rows.push(cells); }
+        }
+        if parsed_rows.is_empty() { return String::new(); }
+        let col_count = parsed_rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        if col_count == 0 { return String::new(); }
+        for row in &mut parsed_rows { while row.len() < col_count { row.push(String::new()); } }
+
+        let mut col_widths = vec![0usize; col_count];
+        for row in &parsed_rows {
+            for (i, cell) in row.iter().enumerate() {
+                let vl = cell.chars().count();
+                if vl > col_widths[i] { col_widths[i] = vl; }
+            }
+        }
+
+        // Old: uniform scaling, min 3
+        let padding_total = col_count * 3 + 1;
+        let total_content: usize = col_widths.iter().sum();
+        let total_width = total_content + padding_total;
+        if total_width > term_w && total_content > 0 {
+            let available = term_w.saturating_sub(padding_total).max(col_count * 3);
+            let ratio = available as f64 / total_content as f64;
+            if ratio < 1.0 {
+                for w in &mut col_widths { *w = (*w as f64 * ratio).max(3.0) as usize; }
+            }
+        }
+
+        let a_re = ansi_re(); let ic_re = inline_code_re(); let b_re = bold_re();
+        let fmt_cell = |cell: &str, w: usize, hdr: bool| -> String {
+            let mut p = ic_re.replace_all(cell, |c: &regex::Captures| format!("\x1b[0;32m{}\x1b[0m", &c[1])).to_string();
+            { let bc = if hdr { "93" } else { "92" };
+              p = b_re.replace_all(&p, |c: &regex::Captures| format!("\x1b[1;3;4;{}m{}\x1b[0m", bc, &c[1])).to_string(); }
+            let s = a_re.replace_all(&p, "").to_string();
+            let pad = w.saturating_sub(s.chars().count());
+            let padded = format!(" {} {:pad$} ", p, "", pad = pad);
+            if hdr { format!("\x1b[1;93m{}\x1b[0m", padded) } else { format!("\x1b[0;92m{}\x1b[0m", padded) }
+        };
+        let hrule = |l: &str, m: &str, r: &str| -> String {
+            let mut s = String::from(l);
+            for (i, w) in col_widths.iter().enumerate() {
+                s.push_str(&"─".repeat(*w + 2));
+                if i < col_count - 1 { s.push_str(m); }
+            }
+            s.push_str(r); s
+        };
+
+        let mut out = String::new();
+        out.push_str(&format!("\x1b[36m{}\x1b[0m\n", hrule("┌", "┬", "┐")));
+        for (idx, row) in parsed_rows.iter().enumerate() {
+            out.push('│');
+            for (i, cell) in row.iter().enumerate() {
+                out.push_str(&fmt_cell(cell, col_widths[i], has_header && idx == 0));
+                out.push('│');
+            }
+            out.push('\n');
+            if idx < parsed_rows.len() - 1 {
+                out.push_str(&format!("\x1b[36m{}\x1b[0m\n", hrule("├", "┼", "┤")));
+            }
+        }
+        out.push_str(&format!("\x1b[36m{}\x1b[0m", hrule("└", "┴", "┘")));
+        out
+    }
+// -- summarize_old_context tests --
 
     #[test]
     fn test_summarize_old_context_no_op() {
