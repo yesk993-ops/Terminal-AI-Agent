@@ -146,6 +146,11 @@ static NVIDIA_MODELS: &[&str] = &[
     "mistralai/mistral-small-4-119b-2603",
 ];
 
+/// Qwen model via NVIDIA NIM — uses its own dedicated API key.
+static NVIDIA_QWEN_MODELS: &[&str] = &[
+    "qwen/qwen3.5-122b-a10b",
+];
+
 /// Returns the OpenRouter API key from the `OPENROUTER_API_KEY` env var, or an empty string if unset.
 pub fn get_openrouter_key() -> String {
     std::env::var("OPENROUTER_API_KEY").unwrap_or_default()
@@ -173,6 +178,11 @@ pub fn get_groq_key() -> Result<String, String> {
 /// Returns the NVIDIA NIM API key from the `NVIDIA_API_KEY` env var.
 pub fn get_nvidia_key() -> String {
     std::env::var("NVIDIA_API_KEY").unwrap_or_default()
+}
+
+/// Returns the dedicated NVIDIA Qwen API key from the `NVIDIA_QWEN_API_KEY` env var.
+pub fn get_nvidia_qwen_key() -> String {
+    std::env::var("NVIDIA_QWEN_API_KEY").unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -635,7 +645,7 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
             })
             .to_string();
         {
-            let bold_color = if is_header { "93" } else { "97" };
+            let bold_color = if is_header { "93" } else { "37" };
             processed = b_re
                 .replace_all(&processed, |caps: &regex::Captures| {
                     format!("[1;{}m{}[0m", bold_color, &caps[1])
@@ -652,7 +662,7 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
             format!("[1;93m{}[0m", padded)
         } else {
             // Alternating row colors for readability
-            let row_color = if row_index % 2 == 0 { "[0;97m" } else { "[2;37m" };
+            let row_color = if row_index % 2 == 0 { "[0;37m" } else { "[0;90m" };
             format!("{}{}[0m", row_color, padded)
         }
     };
@@ -702,7 +712,7 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
     let mut out = String::new();
 
     // Top border
-    out.push_str(&format!("[96m{}[0m
+    out.push_str(&format!("[36m{}[0m
 ", hrule("┌", "┬", "┐")));
 
     for (row_idx, _row) in parsed_rows.iter().enumerate() {
@@ -729,13 +739,13 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
 
         // Grid separator after each row except the last
         if row_idx < parsed_rows.len() - 1 {
-            out.push_str(&format!("[96m{}[0m
+            out.push_str(&format!("[36m{}[0m
 ", hrule("├", "┼", "┤")));
         }
     }
 
     // Bottom border
-    out.push_str(&format!("[96m{}[0m", hrule("└", "┴", "┘")));
+    out.push_str(&format!("[36m{}[0m", hrule("└", "┴", "┘")));
 
     out
 }
@@ -827,14 +837,14 @@ pub fn format_response(resp: &str) -> String {
         for sub in wrapped {
             let mut processed = sub;
             if is_heading {
-                // Headings: bold bright cyan
-                processed = format!("\x1b[1;36m{}\x1b[0m", processed);
+                // Headings: light green
+                processed = format!("\x1b[0;92m{}\x1b[0m", processed);
             } else if is_bullet {
-                // Bullet points: bright white
-                processed = format!("\x1b[0;97m{}\x1b[0m", processed);
+                // Bullet points: light green
+                processed = format!("\x1b[0;92m{}\x1b[0m", processed);
             }
             if is_shell_cmd {
-                processed = format!("\x1b[0;96m{}\x1b[0m", processed);
+                processed = format!("\x1b[0;94m{}\x1b[0m", processed);
             }
             processed = ic_re
                 .replace_all(&processed, |caps: &regex::Captures| {
@@ -844,13 +854,13 @@ pub fn format_response(resp: &str) -> String {
             processed = b_re
                 .replace_all(&processed, |caps: &regex::Captures| {
                     // Bold text: bold + italic + underline + bright green (or gold for acronyms)
-                    let color = if is_acronym { "38;5;220" } else { "97" };
+                    let color = if is_acronym { "33" } else { "37" };
                     format!("\x1b[1;{}m{}\x1b[0m", color, &caps[1])
                 })
                 .to_string();
             if is_acronym {
                 // Wrap entire line in gold WITHOUT stripping inner ANSI formatting
-                processed = format!("\x1b[38;5;220m{}\x1b[0m", processed);
+                processed = format!("\x1b[33m{}\x1b[0m", processed);
             }
             lines.push(processed);
         }
@@ -863,7 +873,7 @@ pub fn format_response(resp: &str) -> String {
         lines.push(String::new());
     }
 
-    let hline = format!("\x1b[96m{}\x1b[0m", "─".repeat(inner_w + 2));
+    let hline = format!("\x1b[36m{}\x1b[0m", "─".repeat(inner_w + 2));
     let mut out = String::new();
     out.push_str(&format!("{}\n", hline));
     for line in &lines {
@@ -1257,7 +1267,8 @@ pub async fn process_query(
     let gk = get_groq_key();
     let gk_val = gk.clone().unwrap_or_default();
     let nk = get_nvidia_key();
-    let no_keys = ak.is_empty() && gk.is_err() && nk.is_empty();
+    let nk_qwen = get_nvidia_qwen_key();
+    let no_keys = ak.is_empty() && gk.is_err() && nk.is_empty() && nk_qwen.is_empty();
 
     push_conversation(user_msg.clone()).await;
     let mut attempts: Vec<String> = Vec::new();
@@ -1283,6 +1294,30 @@ pub async fn process_query(
                         &model_s,
                         1000,
                         12,  // NVIDIA NIM is slower but reliable, give it 12s
+                    ).await;
+                    if let Some(m) = msg {
+                        let text = m.content.unwrap_or_default();
+                        if !text.trim().is_empty() {
+                            let processed = post_process_response(&text);
+                            return (Some(processed), String::new());
+                        }
+                    }
+                    (None, err)
+                }));
+            }
+        }
+        // Add NVIDIA Qwen model (dedicated API key)
+        if !nk_qwen.is_empty() {
+            for model in NVIDIA_QWEN_MODELS {
+                let model_s = model.to_string();
+                let nk_qwen_c = nk_qwen.clone();
+                let mv = Arc::clone(&msg_vec);
+                futs.push(Box::pin(async move {
+                    let (msg, err) = try_model(
+                        || call_nvidia(client, nk_qwen_c.clone(), &model_s, &mv, effective_temp, max_tokens, None, None),
+                        &model_s,
+                        1000,
+                        12,
                     ).await;
                     if let Some(m) = msg {
                         let text = m.content.unwrap_or_default();
@@ -1379,7 +1414,7 @@ pub async fn process_query(
     if no_keys {
         eprintln!(
             "{}",
-            "No API keys set. Export NVIDIA_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY."
+            "No API keys set. Export NVIDIA_API_KEY, NVIDIA_QWEN_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY."
                 .yellow()
         );
     }
@@ -1452,6 +1487,7 @@ pub async fn process_code_query(
     let gk = get_groq_key();
     let gk_val = gk.clone().unwrap_or_default();
     let nk = get_nvidia_key();
+    let nk_qwen = get_nvidia_qwen_key();
     let system_prompt = coding_system_prompt();
 
     let system_msg = ChatMessage {
@@ -1523,7 +1559,7 @@ pub async fn process_code_query(
 
         let mut attempts: Vec<String> = Vec::new();
 
-        // Try NVIDIA, Groq, and first OpenRouter model CONCURRENTLY
+        // Try NVIDIA, NVIDIA Qwen, Groq, and first OpenRouter model CONCURRENTLY
         let nv_fut = async {
             if nk.is_empty() {
                 return (None::<ChatMessage>, Vec::new());
@@ -1604,13 +1640,43 @@ pub async fn process_code_query(
             }
             (None::<ChatMessage>, att)
         };
+        // Add NVIDIA Qwen parallel future
+        let qwen_fut = async {
+            if nk_qwen.is_empty() {
+                return (None::<ChatMessage>, Vec::new());
+            }
+            let mut att = Vec::new();
+            for model in NVIDIA_QWEN_MODELS {
+                let (msg, err) = try_model(
+                    || call_nvidia(client, nk_qwen.clone(), model, &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone()),
+                    model, 1000, 12,
+                ).await;
+                if let Some(m) = msg {
+                    if m.tool_calls.is_some() || tc_re.is_match(&m.content.as_deref().unwrap_or("")) {
+                        return (Some(m), att);
+                    }
+                    let text = m.content.as_deref().unwrap_or("");
+                    let score = score_response(text);
+                    if score > 0.0 {
+                        return (Some(m), att);
+                    }
+                    att.push(format!("{}: low quality (score {:.0})", model, score));
+                } else {
+                    att.push(err);
+                }
+            }
+            (None::<ChatMessage>, att)
+        };
+
         let ((nv_resp, nv_att), (groq_resp, groq_att), (or_resp, or_att)) = tokio::join!(nv_fut, groq_fut, or_fut);
+        let (qwen_resp, qwen_att) = qwen_fut.await;
         attempts.extend(nv_att);
         attempts.extend(groq_att);
         attempts.extend(or_att);
+        attempts.extend(qwen_att);
 
-        // Pick NVIDIA response first (production-grade, no rate limits), then Groq
-        let mut response_msg = nv_resp.or(groq_resp).or(or_resp);
+        // Pick NVIDIA response first (production-grade, no rate limits), then Qwen, then Groq
+        let mut response_msg = nv_resp.or(qwen_resp).or(groq_resp).or(or_resp);
 
         // Try remaining OpenRouter models CONCURRENTLY (join_all)
         if response_msg.is_none() && !ak.is_empty() {
@@ -1850,7 +1916,7 @@ mod tests {
         assert!(!result.contains("**bold**"));
         assert!(result.contains("bold"));
         // Bold text now uses bold+italic+underline+bright green
-        assert!(result.contains("\x1b[1;97m"));
+        assert!(result.contains("\x1b[1;37m"));
         assert!(result.contains("\x1b[0m"));
     }
 
@@ -2084,7 +2150,7 @@ mod tests {
         // ANSI color codes for header
         assert!(result.contains("\x1b[1;93m"));
         // ANSI color codes for data rows
-        assert!(result.contains("\x1b[0;97m"));
+        assert!(result.contains("\x1b[0;37m"));
     }
 
     #[test]
@@ -2125,7 +2191,7 @@ mod tests {
         assert!(result.contains("Name"));
         assert!(result.contains("CPU"));
         // Bold formatting should have ANSI codes
-        assert!(result.contains("\x1b[1;97m"));
+        assert!(result.contains("\x1b[1;37m"));
     }
 
         // -- demo: before/after table rendering comparison --
@@ -2206,12 +2272,12 @@ mod tests {
         let a_re = ansi_re(); let ic_re = inline_code_re(); let b_re = bold_re();
         let fmt_cell = |cell: &str, w: usize, hdr: bool| -> String {
             let mut p = ic_re.replace_all(cell, |c: &regex::Captures| format!("\x1b[0;33m{}\x1b[0m", &c[1])).to_string();
-            { let bc = if hdr { "93" } else { "97" };
+            { let bc = if hdr { "93" } else { "37" };
               p = b_re.replace_all(&p, |c: &regex::Captures| format!("\x1b[1;{}m{}\x1b[0m", bc, &c[1])).to_string(); }
             let s = a_re.replace_all(&p, "").to_string();
             let pad = w.saturating_sub(s.chars().count());
             let padded = format!(" {} {:pad$} ", p, "", pad = pad);
-            if hdr { format!("\x1b[1;93m{}\x1b[0m", padded) } else { format!("\x1b[0;97m{}\x1b[0m", padded) }
+            if hdr { format!("\x1b[1;93m{}\x1b[0m", padded) } else { format!("\x1b[0;37m{}\x1b[0m", padded) }
         };
         let hrule = |l: &str, m: &str, r: &str| -> String {
             let mut s = String::from(l);
