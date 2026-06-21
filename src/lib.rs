@@ -673,8 +673,8 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
         }
         out.push('\n');
 
-        // Add separator line after every row except the last
-        // This gives each row its own bordered cell with solid lines on all sides
+        // Grid style: separator after every row except the last,
+        // giving every cell borders on all sides for a structured grid appearance
         if row_idx < parsed_rows.len() - 1 {
             out.push_str(&format!("\x1b[36m{}\x1b[0m\n", hrule("├", "┼", "┤")));
         }
@@ -2044,7 +2044,7 @@ mod tests {
         // All rows get data color since there's no separator row
         assert!(result.contains("┌"));
         assert!(result.contains("└"));
-        // Now has a separator between the two rows (full grid on all sides)
+        // Grid style — separator between the two data rows even without header
         assert!(result.contains("├"));
     }
 
