@@ -627,7 +627,7 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
     let b_re = bold_re();
 
     // Helper: render a single line of a cell with ANSI formatting and padding
-    let format_cell_line = |line: &str, width: usize, is_header: bool| -> String {
+    let format_cell_line = |line: &str, width: usize, is_header: bool, row_index: usize| -> String {
         // Apply inline formatting (bold, inline code) within this line
         let mut processed = ic_re
             .replace_all(line, |caps: &regex::Captures| {
@@ -635,10 +635,10 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
             })
             .to_string();
         {
-            let bold_color = if is_header { "93" } else { "92" };
+            let bold_color = if is_header { "93" } else { "97" };
             processed = b_re
                 .replace_all(&processed, |caps: &regex::Captures| {
-                    format!("[1;3;4;{}m{}[0m", bold_color, &caps[1])
+                    format!("[1;{}m{}[0m", bold_color, &caps[1])
                 })
                 .to_string();
         }
@@ -651,7 +651,9 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
         if is_header {
             format!("[1;93m{}[0m", padded)
         } else {
-            format!("[0;92m{}[0m", padded)
+            // Alternating row colors for readability
+            let row_color = if row_index % 2 == 0 { "[0;97m" } else { "[2;37m" };
+            format!("{}{}[0m", row_color, padded)
         }
     };
 
@@ -700,7 +702,7 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
     let mut out = String::new();
 
     // Top border
-    out.push_str(&format!("[36m{}[0m
+    out.push_str(&format!("[96m{}[0m
 ", hrule("┌", "┬", "┐")));
 
     for (row_idx, _row) in parsed_rows.iter().enumerate() {
@@ -718,7 +720,7 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
                 } else {
                     ""
                 };
-                let rendered = format_cell_line(cell_text, col_w, is_header);
+                let rendered = format_cell_line(cell_text, col_w, is_header, row_idx);
                 out.push_str(&rendered);
                 out.push('│');
             }
@@ -727,13 +729,13 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
 
         // Grid separator after each row except the last
         if row_idx < parsed_rows.len() - 1 {
-            out.push_str(&format!("[36m{}[0m
+            out.push_str(&format!("[96m{}[0m
 ", hrule("├", "┼", "┤")));
         }
     }
 
     // Bottom border
-    out.push_str(&format!("[36m{}[0m", hrule("└", "┴", "┘")));
+    out.push_str(&format!("[96m{}[0m", hrule("└", "┴", "┘")));
 
     out
 }
@@ -825,11 +827,11 @@ pub fn format_response(resp: &str) -> String {
         for sub in wrapped {
             let mut processed = sub;
             if is_heading {
-                // Headings: bold + italic + underline + bright green
-                processed = format!("\x1b[1;3;4;92m{}\x1b[0m", processed);
+                // Headings: bold bright cyan
+                processed = format!("\x1b[1;36m{}\x1b[0m", processed);
             } else if is_bullet {
-                // Bullet points: italic + underline + green
-                processed = format!("\x1b[3;4;32m{}\x1b[0m", processed);
+                // Bullet points: bright white
+                processed = format!("\x1b[0;97m{}\x1b[0m", processed);
             }
             if is_shell_cmd {
                 processed = format!("\x1b[0;32m{}\x1b[0m", processed);
@@ -842,8 +844,8 @@ pub fn format_response(resp: &str) -> String {
             processed = b_re
                 .replace_all(&processed, |caps: &regex::Captures| {
                     // Bold text: bold + italic + underline + bright green (or gold for acronyms)
-                    let color = if is_acronym { "38;5;220" } else { "92" };
-                    format!("\x1b[1;3;4;{}m{}\x1b[0m", color, &caps[1])
+                    let color = if is_acronym { "38;5;220" } else { "97" };
+                    format!("\x1b[1;{}m{}\x1b[0m", color, &caps[1])
                 })
                 .to_string();
             if is_acronym {
@@ -861,7 +863,7 @@ pub fn format_response(resp: &str) -> String {
         lines.push(String::new());
     }
 
-    let hline = format!("\x1b[36m{}\x1b[0m", "─".repeat(inner_w + 2));
+    let hline = format!("\x1b[96m{}\x1b[0m", "─".repeat(inner_w + 2));
     let mut out = String::new();
     out.push_str(&format!("{}\n", hline));
     for line in &lines {
@@ -1848,7 +1850,7 @@ mod tests {
         assert!(!result.contains("**bold**"));
         assert!(result.contains("bold"));
         // Bold text now uses bold+italic+underline+bright green
-        assert!(result.contains("\x1b[1;3;4;92m"));
+        assert!(result.contains("\x1b[1;97m"));
         assert!(result.contains("\x1b[0m"));
     }
 
@@ -2082,7 +2084,7 @@ mod tests {
         // ANSI color codes for header
         assert!(result.contains("\x1b[1;93m"));
         // ANSI color codes for data rows
-        assert!(result.contains("\x1b[0;92m"));
+        assert!(result.contains("\x1b[0;97m"));
     }
 
     #[test]
@@ -2123,7 +2125,7 @@ mod tests {
         assert!(result.contains("Name"));
         assert!(result.contains("CPU"));
         // Bold formatting should have ANSI codes
-        assert!(result.contains("\x1b[1;3;4;92m"));
+        assert!(result.contains("\x1b[1;97m"));
     }
 
         // -- demo: before/after table rendering comparison --
@@ -2204,12 +2206,12 @@ mod tests {
         let a_re = ansi_re(); let ic_re = inline_code_re(); let b_re = bold_re();
         let fmt_cell = |cell: &str, w: usize, hdr: bool| -> String {
             let mut p = ic_re.replace_all(cell, |c: &regex::Captures| format!("\x1b[0;32m{}\x1b[0m", &c[1])).to_string();
-            { let bc = if hdr { "93" } else { "92" };
-              p = b_re.replace_all(&p, |c: &regex::Captures| format!("\x1b[1;3;4;{}m{}\x1b[0m", bc, &c[1])).to_string(); }
+            { let bc = if hdr { "93" } else { "97" };
+              p = b_re.replace_all(&p, |c: &regex::Captures| format!("\x1b[1;{}m{}\x1b[0m", bc, &c[1])).to_string(); }
             let s = a_re.replace_all(&p, "").to_string();
             let pad = w.saturating_sub(s.chars().count());
             let padded = format!(" {} {:pad$} ", p, "", pad = pad);
-            if hdr { format!("\x1b[1;93m{}\x1b[0m", padded) } else { format!("\x1b[0;92m{}\x1b[0m", padded) }
+            if hdr { format!("\x1b[1;93m{}\x1b[0m", padded) } else { format!("\x1b[0;97m{}\x1b[0m", padded) }
         };
         let hrule = |l: &str, m: &str, r: &str| -> String {
             let mut s = String::from(l);
@@ -2221,7 +2223,7 @@ mod tests {
         };
 
         let mut out = String::new();
-        out.push_str(&format!("\x1b[36m{}\x1b[0m\n", hrule("┌", "┬", "┐")));
+        out.push_str(&format!("\x1b[96m{}\x1b[0m\n", hrule("┌", "┬", "┐")));
         for (idx, row) in parsed_rows.iter().enumerate() {
             out.push('│');
             for (i, cell) in row.iter().enumerate() {
@@ -2230,10 +2232,10 @@ mod tests {
             }
             out.push('\n');
             if idx < parsed_rows.len() - 1 {
-                out.push_str(&format!("\x1b[36m{}\x1b[0m\n", hrule("├", "┼", "┤")));
+                out.push_str(&format!("\x1b[96m{}\x1b[0m\n", hrule("├", "┼", "┤")));
             }
         }
-        out.push_str(&format!("\x1b[36m{}\x1b[0m", hrule("└", "┴", "┘")));
+        out.push_str(&format!("\x1b[96m{}\x1b[0m", hrule("└", "┴", "┘")));
         out
     }
 // -- summarize_old_context tests --
