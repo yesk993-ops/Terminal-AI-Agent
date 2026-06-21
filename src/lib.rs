@@ -631,7 +631,7 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
         // Apply inline formatting (bold, inline code) within this line
         let mut processed = ic_re
             .replace_all(line, |caps: &regex::Captures| {
-                format!("[0;32m{}[0m", &caps[1])
+                format!("[0;33m{}[0m", &caps[1])
             })
             .to_string();
         {
@@ -794,7 +794,7 @@ pub fn format_response(resp: &str) -> String {
         if in_code {
             let wrapped: Vec<String> = wrap(raw_line, inner_w)
                 .into_iter()
-                .map(|s| format!("\x1b[0;32m{}\x1b[0m", s))
+                .map(|s| format!("\x1b[0;33m{}\x1b[0m", s))
                 .collect();
             lines.extend(wrapped);
             continue;
@@ -834,11 +834,11 @@ pub fn format_response(resp: &str) -> String {
                 processed = format!("\x1b[0;97m{}\x1b[0m", processed);
             }
             if is_shell_cmd {
-                processed = format!("\x1b[0;32m{}\x1b[0m", processed);
+                processed = format!("\x1b[0;96m{}\x1b[0m", processed);
             }
             processed = ic_re
                 .replace_all(&processed, |caps: &regex::Captures| {
-                    format!("\x1b[0;32m{}\x1b[0m", &caps[1])
+                    format!("\x1b[0;33m{}\x1b[0m", &caps[1])
                 })
                 .to_string();
             processed = b_re
@@ -1866,7 +1866,7 @@ mod tests {
         let result = format_response("run `cmd` now");
         assert!(!result.contains("`cmd`"));
         assert!(result.contains("cmd"));
-        assert!(result.contains("\x1b[0;32m"));
+        assert!(result.contains("\x1b[0;33m"));
     }
 
     #[test]
@@ -2205,7 +2205,7 @@ mod tests {
 
         let a_re = ansi_re(); let ic_re = inline_code_re(); let b_re = bold_re();
         let fmt_cell = |cell: &str, w: usize, hdr: bool| -> String {
-            let mut p = ic_re.replace_all(cell, |c: &regex::Captures| format!("\x1b[0;32m{}\x1b[0m", &c[1])).to_string();
+            let mut p = ic_re.replace_all(cell, |c: &regex::Captures| format!("\x1b[0;33m{}\x1b[0m", &c[1])).to_string();
             { let bc = if hdr { "93" } else { "97" };
               p = b_re.replace_all(&p, |c: &regex::Captures| format!("\x1b[1;{}m{}\x1b[0m", bc, &c[1])).to_string(); }
             let s = a_re.replace_all(&p, "").to_string();
