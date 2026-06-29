@@ -253,6 +253,19 @@ build_project() {
 }
 
 # --------------------------------------------------
+# Install cargo-watch for auto-rebuild on changes
+# --------------------------------------------------
+install_cargo_watch() {
+    if command -v cargo-watch &>/dev/null; then
+        echo -e "${GREEN}cargo-watch already installed.${NC}"
+    else
+        echo -e "${YELLOW}Installing cargo-watch for auto-rebuild on file changes...${NC}"
+        cargo install cargo-watch --quiet
+        echo -e "${GREEN}cargo-watch installed.${NC}"
+    fi
+}
+
+# --------------------------------------------------
 # Install globally (Linux/macOS)
 # --------------------------------------------------
 install_global() {
@@ -323,6 +336,11 @@ ask() {
 code() {
     /usr/local/bin/terminal_ai_agent --code "$@"
 }
+
+# Terminal AI Agent — dev mode (auto-rebuild on file changes, then run)
+dev() {
+    (cd "$HOME/terminal-ai-agent" && cargo watch -x "run -- $*")
+}
 EOF
         echo -e "${GREEN}Added ask() and code() aliases to $rc for new terminals.${NC}"
     fi
@@ -353,6 +371,7 @@ next_steps() {
     echo -e "Aliases added to your shell:"
     echo -e "  ${CYAN}ask${NC}   query mode (general Q&A)"
     echo -e "  ${CYAN}code${NC}  coding agent mode (files, bash, search)"
+    echo -e "  ${CYAN}dev${NC}   dev mode (auto-rebuilds & runs on file changes)"
     echo ""
     echo -e "OpenCode gateway is running at ${CYAN}http://127.0.0.1:8083${NC}"
     echo -e "  → Free models available immediately: opencode/big-pickle, opencode/gpt-5-nano"
@@ -373,6 +392,7 @@ install_rust
 install_node
 source "$HOME/.cargo/env" 2>/dev/null || true
 build_project
+install_cargo_watch
 install_global
 install_opencode_gateway
 setup_rc_alias
