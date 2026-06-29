@@ -879,7 +879,7 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
             })
             .to_string();
         {
-            let bold_color = if is_header { "93" } else { "37" };
+            let bold_color = if is_header { "93" } else { "36" };
             processed = b_re
                 .replace_all(&processed, |caps: &regex::Captures| {
                     format!("[1;{}m{}[0m", bold_color, &caps[1])
@@ -1087,8 +1087,8 @@ pub fn format_response(resp: &str) -> String {
                 .to_string();
             processed = b_re
                 .replace_all(&processed, |caps: &regex::Captures| {
-                    // Bold text: bold + italic + underline + bright green (or gold for acronyms)
-                    let color = if is_acronym { "33" } else { "37" };
+                    // Bold text: bold cyan for key terms, gold for acronyms
+                    let color = if is_acronym { "33" } else { "36" };
                     format!("\x1b[1;{}m{}\x1b[0m", color, &caps[1])
                 })
                 .to_string();
@@ -2432,7 +2432,7 @@ mod tests {
         assert!(!result.contains("**bold**"));
         assert!(result.contains("bold"));
         // Bold text now uses bold+italic+underline+bright green
-        assert!(result.contains("\x1b[1;37m"));
+        assert!(result.contains("\x1b[1;36m"));
         assert!(result.contains("\x1b[0m"));
     }
 
@@ -2707,7 +2707,7 @@ mod tests {
         assert!(result.contains("Name"));
         assert!(result.contains("CPU"));
         // Bold formatting should have ANSI codes
-        assert!(result.contains("\x1b[1;37m"));
+        assert!(result.contains("\x1b[1;36m"));
     }
 
         // -- demo: before/after table rendering comparison --
@@ -2788,7 +2788,7 @@ mod tests {
         let a_re = ansi_re(); let ic_re = inline_code_re(); let b_re = bold_re();
         let fmt_cell = |cell: &str, w: usize, hdr: bool| -> String {
             let mut p = ic_re.replace_all(cell, |c: &regex::Captures| format!("\x1b[0;33m{}\x1b[0m", &c[1])).to_string();
-            { let bc = if hdr { "93" } else { "37" };
+            { let bc = if hdr { "93" } else { "36" };
               p = b_re.replace_all(&p, |c: &regex::Captures| format!("\x1b[1;{}m{}\x1b[0m", bc, &c[1])).to_string(); }
             let s = a_re.replace_all(&p, "").to_string();
             let pad = w.saturating_sub(s.chars().count());

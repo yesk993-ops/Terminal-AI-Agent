@@ -298,7 +298,7 @@ The coding agent (`--code`) follows a structured workflow:
 
 | Element | ANSI code | Sample |
 |---|---|---|
-| **Bold key terms** `**text**` | `\x1b[1;37m` (bold white) | **key concept** |
+| **Bold key terms** `**text**` | `\x1b[1;36m` (bold cyan) | **key concept** |
 | Headings `### Title` | `\x1b[0;92m` (light green) | Section heading |
 | Code blocks `` ``` `` | `\x1b[0;33m` (gold) | Multi-line code |
 | Inline commands `` `cmd` `` | `\x1b[0;33m` (gold) | Commands, flags, paths |
