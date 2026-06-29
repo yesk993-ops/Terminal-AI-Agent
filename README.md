@@ -70,8 +70,10 @@ When `GROQ_API_KEY` is set, tokens stream in real-time automatically:
 terminal_ai_agent "What is the difference between Docker and Podman?"
 ```
 
-### Coding agent mode
+### Coding agent mode (with alias)
 ```bash
+code "create a sample Dockerfile for a Rust web app"
+# or without alias:
 terminal_ai_agent --code "create a sample Dockerfile for a Rust web app"
 ```
 
@@ -89,24 +91,34 @@ terminal_ai_agent
 > exit
 ```
 
-### Coding agent REPL
+### Coding agent REPL (with alias)
 ```bash
-terminal_ai_agent --code
+code
 > ask find all Rust files with unsafe blocks
 > ask refactor main.rs to use anyhow
 > exit
 ```
 
-### Shell shortcut
-The setup script installs an `ask` wrapper at `/usr/local/bin/ask`. Alternatively, add to `~/.bashrc`:
+### Shell aliases
+
+The setup script installs an `ask` wrapper at `/usr/local/bin/ask`. For quick access to both modes, add these to `~/.bashrc` or `~/.zshrc`:
 
 ```bash
-ask() { terminal_ai_agent "$@"; }
+# Query mode (general Q&A)
+ask()   { terminal_ai_agent "$@"; }
+
+# Code agent mode (file operations, bash, search)
+code()  { terminal_ai_agent --code "$@"; }
 ```
 
-Then:
+Then use them like this:
 ```bash
-ask What is the capital of France?
+# Query mode — general questions
+ask "What is the capital of France?"
+
+# Code agent — file operations, bash, project tasks
+code "create a Dockerfile for a Rust web app"
+code "find all Rust files with unsafe blocks"
 ```
 
 ## Environment variables
