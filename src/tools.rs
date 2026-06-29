@@ -254,12 +254,32 @@ fn exec_edit_file(args: &Value) -> String {
     }
 }
 
+/// Fixes common shell quoting mistakes that LLMs make.
+/// Returns the corrected command string.
+fn fix_shell_quoting(cmd: &str) -> String {
+    // Pattern: single-quoted brace expansion like '{a,b}' → {a,b}
+    // Brace expansion requires unquoted braces to work
+    if cmd.contains("'{") && cmd.contains(",}") || cmd.contains(", '") {
+        // Only fix if the command contains brace expansion patterns inside single quotes
+        let mut result = cmd.to_string();
+        // Replace '{' with { and '}' with } when they appear to be brace expansion
+        // Specifically: '{\w+,\w+}' or '{.\w+,\w+}'
+        let re = regex::Regex::new(r"'\{([^}']+)}'").unwrap();
+        result = re.replace_all(&result, "{$1}").to_string();
+        // Also fix unmatched patterns like '{a,b}'  (no text before comma)
+        let re2 = regex::Regex::new(r"'\{([^,']+),([^}']+)}'").unwrap();
+        result = re2.replace_all(&result, "{$1,$2}").to_string();
+        return result;
+    }
+    cmd.to_string()
+}
+
 async fn exec_bash(args: &Value) -> String {
     let cmd = match args.get("command").and_then(|v| v.as_str()) {
         Some(c) => c,
         None => return "Missing argument: command".to_string(),
     };
-    let cmd = cmd.to_string();
+    let cmd = fix_shell_quoting(cmd);
 
     let output = timeout(
         Duration::from_secs(30),

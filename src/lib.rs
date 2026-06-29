@@ -1,4 +1,6 @@
 use std::collections::{HashMap, VecDeque};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -8,6 +10,7 @@ use regex::Regex;
 use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::Write;
 use textwrap::wrap;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
@@ -107,9 +110,27 @@ pub struct ToolFunction {
     pub parameters: Value,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Clone)]
 pub enum ToolChoice {
-    Auto(String),
+    Auto,
+    None,
+    Function { r#type: String, function: serde_json::Value },
+}
+
+impl serde::Serialize for ToolChoice {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let value = match self {
+            ToolChoice::Auto => serde_json::json!("auto"),
+            ToolChoice::None => serde_json::json!("none"),
+            ToolChoice::Function { r#type, function } => {
+                serde_json::json!({"type": r#type, "function": function})
+            }
+        };
+        value.serialize(serializer)
+    }
 }
 
 #[derive(Deserialize)]
@@ -374,6 +395,15 @@ static QUERY_COUNT: LazyLock<std::sync::atomic::AtomicU32> =
 const MAX_TURNS: usize = 12;
 const SAVE_EVERY: u32 = 5;
 
+/// Simple in-memory response cache: query_hash -> response
+static RESPONSE_CACHE: LazyLock<std::sync::Mutex<HashMap<u64, String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+const CACHE_MAX_ENTRIES: usize = 64;
+
+/// Background-generated follow-up suggestions for the current conversation
+static FOLLOW_UP_SUGGESTIONS: LazyLock<RwLock<Vec<String>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+
 /// Appends a message to the in-memory conversation history.
 ///
 /// Automatically trims history to the last 6 turns (12 messages) using VecDeque::pop_front (O(1)).
@@ -475,6 +505,210 @@ pub async fn load_conversation() {
         let mut c = CONVERSATION.write().await;
         *c = VecDeque::from(hist);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Response cache helpers
+// ---------------------------------------------------------------------------
+
+fn cache_key(query: &str, temperature: f32) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    query.hash(&mut hasher);
+    temperature.to_bits().hash(&mut hasher);
+    hasher.finish()
+}
+
+fn cache_get(query: &str, temperature: f32) -> Option<String> {
+    let key = cache_key(query, temperature);
+    let cache = RESPONSE_CACHE.lock().unwrap();
+    cache.get(&key).cloned()
+}
+
+fn cache_put(query: &str, temperature: f32, response: &str) {
+    let key = cache_key(query, temperature);
+    let mut cache = RESPONSE_CACHE.lock().unwrap();
+    if cache.len() >= CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(key, response.to_string());
+}
+
+pub async fn get_suggestions() -> Vec<String> {
+    FOLLOW_UP_SUGGESTIONS.read().await.clone()
+}
+
+/// Attempts to generate follow-up questions using the fastest available model (Groq).
+async fn generate_followups(client: &Client, query: &str, response: &str) -> Vec<String> {
+    let prompt = format!(
+        "Based on this Q&A:\nQ: {}\nA: {}\n\nSuggest 2-3 follow-up questions as a JSON array of strings. Return ONLY the array, no other text.",
+        query, response
+    );
+
+    let msg = ChatMessage {
+        role: "user".to_string(),
+        content: Some(prompt),
+        tool_calls: None,
+        tool_call_id: None,
+    };
+    let msgs = vec![msg];
+
+    let gk = get_groq_key();
+    if let Ok(ref key) = gk {
+        if let Ok(result) = call_groq(client, key.clone(), "llama-3.3-70b-versatile", &msgs, 0.5, 256, None, None).await {
+            if let Some(content) = result.content {
+                let parsed = parse_json_array(&content);
+                if !parsed.is_empty() {
+                    return parsed;
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn parse_json_array(s: &str) -> Vec<String> {
+    let trimmed = s.trim();
+    if let Some(start) = trimmed.find('[') {
+        if let Some(end) = trimmed.rfind(']') {
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(&trimmed[start..=end]) {
+                return arr;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Monotonic generation counter — prevents stale self-reflection from overwriting
+/// a newer response when the user asks a follow-up before reflection finishes.
+static GENERATION: LazyLock<std::sync::atomic::AtomicU64> =
+    LazyLock::new(|| std::sync::atomic::AtomicU64::new(0));
+
+/// Self-reflection: uses the fastest available model (Groq) to critique the response
+/// and optionally produce an improved version. Runs in background after main display.
+async fn self_reflect(client: &Client, query: &str, response: &str) -> Option<String> {
+    let prompt = format!(
+        "Review this response.\n\nQuery: {}\nResponse: {}\n\n\
+        Is it accurate, complete, and well-structured? \
+        If you can improve it, return ONLY the improved version. \
+        If it's already good, return exactly: NO_CHANGE\n\n\
+        Improved response:",
+        query, response
+    );
+
+    let msgs = vec![ChatMessage {
+        role: "user".to_string(),
+        content: Some(prompt),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let gk = get_groq_key();
+    let key = gk.as_ref().ok()?;
+    let result = call_groq(client, key.clone(), "llama-3.3-70b-versatile", &msgs, 0.3, 1024, None, None).await.ok()?;
+    let content = result.content?;
+    let trimmed = content.trim().to_string();
+
+    if !trimmed.is_empty()
+        && !trimmed.eq_ignore_ascii_case("no_change")
+        && trimmed.len() > response.len() / 3
+    {
+        let cleaned = trimmed
+            .strip_prefix("Improved response:")
+            .unwrap_or(&trimmed)
+            .strip_prefix("improved response:")
+            .unwrap_or(&trimmed)
+            .trim()
+            .to_string();
+        return Some(cleaned);
+    }
+    None
+}
+
+/// Builds a lightweight project context summary from the current working directory.
+/// Scans top-level files and key source directories to give the coding agent
+/// awareness of the project structure. Returns a compact string suitable for
+/// injection into the system prompt.
+fn build_project_context() -> String {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut ctx = String::new();
+
+    // Read project name from Cargo.toml or package.json
+    let project_name = std::fs::read_to_string(cwd.join("Cargo.toml"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.trim().starts_with("name ="))
+                .and_then(|l| l.split('=').nth(1))
+                .map(|v| v.trim().trim_matches('"').to_string())
+        })
+        .or_else(|| {
+            std::fs::read_to_string(cwd.join("package.json")).ok().and_then(|s| {
+                serde_json::from_str::<Value>(&s).ok()
+                    .and_then(|v| v.get("name").and_then(|n| n.as_str().map(String::from)))
+            })
+        })
+        .unwrap_or_default();
+
+    if !project_name.is_empty() {
+        ctx.push_str(&format!("Project: {}\n", project_name));
+    }
+
+    // Collect source files (respect .gitignore-like patterns)
+    let mut files: Vec<String> = Vec::new();
+    let ignore_dirs = [".git", "node_modules", "target", ".venv", "venv", "__pycache__", ".opencode"];
+
+    if let Ok(entries) = std::fs::read_dir(&cwd) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if ignore_dirs.contains(&fname) || fname.starts_with('.') {
+                    continue;
+                }
+                // Look for source files one level deep
+                if let Ok(sub) = std::fs::read_dir(&path) {
+                    for sub_entry in sub.flatten() {
+                        let sp = sub_entry.path();
+                        if sp.is_file() {
+                            let ext = sp.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            let src_exts = ["rs", "py", "js", "ts", "go", "java", "rb", "c", "cpp", "h", "hpp", "toml", "json", "yaml", "yml", "md", "sh", "css", "html", "svelte", "vue"];
+                            if src_exts.contains(&ext) && files.len() < 30 {
+                                let rel = sp.strip_prefix(&cwd).unwrap_or(&sp).display().to_string();
+                                let line_count = std::fs::read_to_string(&sp).ok()
+                                    .map(|c| c.lines().count().to_string())
+                                    .unwrap_or_default();
+                                files.push(format!("  {} ({} lines)", rel, line_count));
+                            }
+                        }
+                    }
+                }
+            } else if path.is_file() {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let top_exts = ["rs", "py", "js", "ts", "toml", "json", "yaml", "yml", "md", "sh", "dockerfile", "gitignore"];
+                if top_exts.contains(&ext) || path.file_name().and_then(|n| n.to_str()) == Some("Dockerfile") {
+                    let rel = path.strip_prefix(&cwd).unwrap_or(&path).display().to_string();
+                    let line_count = std::fs::read_to_string(&path).ok()
+                        .map(|c| c.lines().count().to_string())
+                        .unwrap_or_default();
+                    files.push(format!("  {} ({} lines)", rel, line_count));
+                }
+            }
+        }
+    }
+
+    if !files.is_empty() {
+        ctx.push_str("Files:\n");
+        for f in files {
+            ctx.push_str(&f);
+            ctx.push('\n');
+        }
+    }
+
+    if !ctx.is_empty() {
+        ctx.insert_str(0, "[Project context]\n");
+        ctx.push_str("[/Project context]");
+    }
+    ctx
 }
 
 // ---------------------------------------------------------------------------
@@ -1110,6 +1344,13 @@ fn chat_system_prompt() -> &'static str {
     static PROMPT: LazyLock<String> = LazyLock::new(|| {
         r"You are a highly capable AI assistant. Follow these rules strictly:
 
+## Reasoning (CRITICAL)
+- For complex questions, reason step-by-step internally before answering
+- Break down multi-part questions into sub-problems and address each one
+- Consider multiple perspectives and edge cases
+- If you're uncertain, acknowledge the uncertainty and explain why
+- Always verify your reasoning — check for contradictions or leaps in logic
+
 ## Response quality
 - Lead with the direct answer, then explain if needed
 - Use concrete examples, numbers, and specific facts — avoid vague generalities
@@ -1138,6 +1379,7 @@ fn chat_system_prompt() -> &'static str {
 - Vary your examples and analogies each time
 - Match the depth to the question: simple question = simple answer
 - If the question is ambiguous, pick the most useful interpretation and answer it
+- Anticipate follow-up questions and address them preemptively
 
 ## What NOT to do
 - Don't start with filler phrases like Here is or Sure — just answer
@@ -1224,6 +1466,97 @@ where
     (None, last_err)
 }
 
+/// Streams a response from the fastest available model (Groq), printing tokens
+/// as they arrive for a ChatGPT-like real-time experience.
+/// Falls back gracefully to the existing parallel racing on any error.
+async fn try_stream_response(
+    client: &Client,
+    _query: &str,
+    messages: &[ChatMessage],
+    temperature: f32,
+    max_tokens: u32,
+) -> Option<String> {
+    let gk = get_groq_key();
+    let key = gk.as_ref().ok()?;
+
+    let body = serde_json::json!({
+        "model": "llama-3.3-70b-versatile",
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": true,
+    });
+
+    let req = client
+        .post("https://api.groq.com/openai/v1/chat/completions")
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "TerminalAI-Agent/0.1.0")
+        .header("Authorization", format!("Bearer {}", key))
+        .json(&body);
+
+    let resp = match req.send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return None,
+    };
+
+    // Show a subtle waiting indicator (overwritten by first token)
+    print!("{}", "   ".dimmed());
+    let _ = std::io::stdout().flush();
+
+    let mut full_content = String::new();
+    let mut stream = resp.bytes_stream();
+    let mut first_token = true;
+
+    use futures_util::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(_) => break,
+        };
+        let text = String::from_utf8_lossy(&chunk);
+
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.starts_with("data: ") {
+                continue;
+            }
+            let data = &line[6..];
+            if data == "[DONE]" {
+                break;
+            }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(choices) = val.get("choices").and_then(|c| c.as_array()) {
+                    if let Some(choice) = choices.first() {
+                        if let Some(delta) = choice.get("delta") {
+                            if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                if first_token {
+                                    // Clear the waiting indicator
+                                    first_token = false;
+                                }
+                                full_content.push_str(content);
+                                print!("{}", content);
+                                std::io::stdout().flush().ok();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if full_content.is_empty() {
+        return None;
+    }
+
+    println!();
+    // Print horizontal rule to match format_response style
+    let term_w = safe_termwidth();
+    let inner_w = term_w.saturating_sub(2).max(20);
+    println!("\x1b[36m{}\x1b[0m", "─".repeat(inner_w + 2));
+
+    Some(post_process_response(&full_content))
+}
+
 /// Runs a user query against models concurrently with scoring and fallback.
 pub async fn process_query(
     client: &Client,
@@ -1236,6 +1569,20 @@ pub async fn process_query(
         temperature
     };
     let max_tokens = auto_max_tokens(query);
+
+    // Check cache before making API calls
+    if let Some(cached) = cache_get(query, effective_temp) {
+        let assistant = ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(cached.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        push_conversation(assistant).await;
+        save_conversation().await;
+        println!("{}", format_response(&cached));
+        return;
+    }
 
     let user_msg = ChatMessage {
         role: "user".to_string(),
@@ -1271,6 +1618,49 @@ pub async fn process_query(
     let no_keys = ak.is_empty() && gk.is_err() && nk.is_empty() && nk_qwen.is_empty();
 
     push_conversation(user_msg.clone()).await;
+
+    // Try streaming first (Groq) for ChatGPT-like real-time experience
+    if let Some(streamed) = try_stream_response(client, query, &msg_vec, effective_temp, max_tokens).await {
+        cache_put(query, effective_temp, &streamed);
+        let assistant = ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(streamed.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        push_conversation(assistant).await;
+        save_conversation().await;
+
+        // Background follow-ups
+        let fc = client.clone();
+        let fq = query.to_string();
+        let fr = streamed.clone();
+        tokio::spawn(async move {
+            let suggestions = generate_followups(&fc, &fq, &fr).await;
+            *FOLLOW_UP_SUGGESTIONS.write().await = suggestions;
+        });
+
+        // Background self-reflection
+        let sr_client = client.clone();
+        let sr_query = query.to_string();
+        let sr_response = streamed.clone();
+        let sr_gen = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        tokio::spawn(async move {
+            if let Some(improved) = self_reflect(&sr_client, &sr_query, &sr_response).await {
+                let current_gen = GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+                if current_gen == sr_gen {
+                    let mut conv = CONVERSATION.write().await;
+                    if let Some(last) = conv.back_mut() {
+                        if last.role == "assistant" && last.content.as_deref() == Some(&sr_response) {
+                            last.content = Some(improved);
+                        }
+                    }
+                }
+            }
+        });
+        return;
+    }
+
     let mut attempts: Vec<String> = Vec::new();
 
     // Run ALL models concurrently (FuturesUnordered) — return the FIRST valid response
@@ -1393,6 +1783,8 @@ pub async fn process_query(
     }
 
     if let Some(best) = response {
+        cache_put(query, effective_temp, &best);
+
         let assistant = ChatMessage {
             role: "assistant".to_string(),
             content: Some(best.clone()),
@@ -1402,6 +1794,35 @@ pub async fn process_query(
         push_conversation(assistant).await;
         save_conversation().await;
         println!("{}", format_response(&best));
+
+        // Spawn background follow-up generation (no impact on response speed)
+        let fc = client.clone();
+        let fq = query.to_string();
+        let fr = best.clone();
+        tokio::spawn(async move {
+            let suggestions = generate_followups(&fc, &fq, &fr).await;
+            *FOLLOW_UP_SUGGESTIONS.write().await = suggestions;
+        });
+
+        // Self-reflection: critique and improve response in background
+        let sr_client = client.clone();
+        let sr_query = query.to_string();
+        let sr_response = best.clone();
+        let sr_gen = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        tokio::spawn(async move {
+            if let Some(improved) = self_reflect(&sr_client, &sr_query, &sr_response).await {
+                let current_gen = GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+                if current_gen == sr_gen {
+                    let mut conv = CONVERSATION.write().await;
+                    if let Some(last) = conv.back_mut() {
+                        if last.role == "assistant" && last.content.as_deref() == Some(&sr_response) {
+                            last.content = Some(improved);
+                        }
+                    }
+                }
+            }
+        });
+
         return;
     }
 
@@ -1424,6 +1845,14 @@ pub async fn process_query(
 fn coding_system_prompt() -> String {
     r#"You are an expert coding agent. You can read, write, edit files, run shell commands, search code, and find files.
 
+## Reasoning (CRITICAL — follow this every time)
+Before each action, think step-by-step:
+1. What is the actual goal? Break it down
+2. What do I know? What information do I still need?
+3. What is the simplest approach that could work?
+4. What could go wrong? How will I handle it?
+5. After each action, verify the result before proceeding
+
 ## Available tools
 - bash: Run shell commands. Args: { "command": "..." }
 - read_file: Read file contents. Args: { "path": "..." }
@@ -1442,13 +1871,28 @@ Examples:
 <tool_call>{"name":"read_file","arguments":{"path":"src/main.rs"}}</tool_call>
 <tool_call>{"name":"grep","arguments":{"pattern":"fn main","path":"src","include":"*.rs"}}</tool_call>
 
+## Planning phase (CRITICAL — output this first)
+When given a multi-step task, FIRST output a numbered plan inside <plan> tags:
+<plan>
+  Step 1: [tool] what to do
+  Step 2: [tool] what to do next
+  ...
+</plan>
+Then execute each step strictly in order. Do NOT skip ahead.
+
+## CRITICAL RULE — Write ALL files FIRST
+Complete ALL write_file operations BEFORE running any bash commands.
+Do NOT run bash commands that depend on files until after those files are created.
+This means: first create every file, THEN run docker/make/test commands.
+
 ## Workflow
 1. Understand the task — read relevant files first if needed
-2. Plan your approach before acting
-3. Call one tool at a time, wait for the result
-4. Verify your work — check files after editing, run tests after changes
-5. If a tool call fails, analyze the error and try a different approach
-6. When done, provide a clear summary of what was done
+2. Plan your approach — list ALL files to create and ALL steps in <plan> tags
+3. Write ALL files using write_file FIRST (one at a time)
+4. Only AFTER all files are written, run bash commands (docker, make, etc.)
+5. Verify your work — check files after editing, run tests after changes
+6. If a tool call fails, analyze the error and try a different approach
+7. When done, provide a clear summary of what was done
 
 ## Error recovery
 - If a file doesn't exist, check the path with list_dir or glob
@@ -1480,7 +1924,7 @@ pub async fn process_code_query(
         temperature
     };
     let max_tokens = 2048u32;
-    const MAX_MESSAGES: usize = 30;
+    const MAX_MESSAGES: usize = 50;
 
     // Cache API keys and system prompt outside the loop
     let ak = get_openrouter_key();
@@ -1503,10 +1947,26 @@ pub async fn process_code_query(
         tool_call_id: None,
     };
 
-    let mut messages = vec![system_msg, user_msg];
+    // Inject project context as a system message for project awareness
+    let project_ctx = build_project_context();
+    let mut messages = if project_ctx.is_empty() {
+        vec![system_msg, user_msg]
+    } else {
+        let ctx_msg = ChatMessage {
+            role: "system".to_string(),
+            content: Some(project_ctx),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        vec![system_msg, ctx_msg, user_msg]
+    };
+
     let tc_re = tool_call_re();
     let mut iterations = 0;
-    const MAX_ITER: usize = 25;
+    const MAX_ITER: usize = 40;
+
+    // Track executed tool calls to detect and block duplicate loops
+    let mut executed_calls: Vec<(String, String)> = Vec::new();
 
     // Build tool definitions for native function calling (done once, reused)
     let tool_defs: Vec<Tool> = tools::all_tool_defs()
@@ -1526,14 +1986,35 @@ pub async fn process_code_query(
         })
         .collect();
     let tools = Some(tool_defs);
-    let tool_choice = Some(ToolChoice::Auto("auto".to_string()));
+    let tool_choice = Some(ToolChoice::Auto);
 
     fn trim_messages(msgs: &mut Vec<ChatMessage>) {
         if msgs.len() > MAX_MESSAGES {
             let system_msg = msgs[0].clone();
-            let keep = msgs.len() - MAX_MESSAGES + 1;
+            // Try to preserve project context message (index 1) if present
+            let ctx_msg = if msgs.len() > 2 && msgs[1].role == "system" && msgs[1].content.as_deref().map_or(false, |c| c.starts_with("[Project context]")) {
+                Some(msgs[1].clone())
+            } else {
+                None
+            };
+            let ctx_offset = if ctx_msg.is_some() { 1 } else { 0 };
+            let keep = msgs.len() - MAX_MESSAGES + 1 + ctx_offset;
             let mut new_msgs = vec![system_msg];
+            if let Some(ctx) = ctx_msg {
+                new_msgs.push(ctx);
+            }
             new_msgs.extend_from_slice(&msgs[keep..]);
+            // Shorten long tool result messages to preserve context
+            for msg in &mut new_msgs {
+                if msg.role == "tool" {
+                    if let Some(ref content) = msg.content {
+                        if content.len() > 300 {
+                            let trimmed: String = content.chars().take(300).collect();
+                            msg.content = Some(format!("{}... (truncated)", trimmed));
+                        }
+                    }
+                }
+            }
             *msgs = new_msgs;
         }
     }
@@ -1725,6 +2206,41 @@ pub async fn process_code_query(
         };
 
         let response_text = msg.content.as_deref().unwrap_or("").to_string();
+
+        // Detect and skip duplicate tool calls (model looping on same action)
+        let tc_key = if let Some(tc) = msg_to_tool_call(&msg) {
+            Some((tc.name.clone(), tc.arguments.to_string()))
+        } else {
+            tc_re.captures(&response_text).and_then(|caps| {
+                let tag = caps.get(1)?.as_str().to_string();
+                let after_tag = &response_text[caps.get(0).unwrap().end()..];
+                let json_str = extract_balanced_json(after_tag)?;
+                Some((tag, json_str.to_string()))
+            })
+        };
+
+        if let Some(ref key) = tc_key {
+            if executed_calls.iter().any(|(n, a)| n == &key.0 && a == &key.1) {
+                let dup_msg = format!("⚠️ Duplicate tool call '{}' with same arguments — skipped to prevent loop", key.0);
+                eprintln!("{}", dup_msg.yellow());
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(response_text),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(format!("[system] {} Please try a different approach or provide a summary.", dup_msg)),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                trim_messages(&mut messages);
+                save_conversation().await;
+                continue;
+            }
+            executed_calls.push(key.clone());
+        }
 
         // Check for native tool calls (from function calling API)
         if let Some(tc) = msg_to_tool_call(&msg) {

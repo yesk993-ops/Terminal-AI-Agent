@@ -24,7 +24,7 @@ strip = true
 panic = "abort"
 
 [dependencies]
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", features = ["json", "stream"] }
 tokio = { version = "1", features = ["io-util", "io-std", "time", "sync", "macros", "rt-multi-thread", "signal"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde = { version = "1.0", features = ["derive"] }

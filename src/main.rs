@@ -141,6 +141,18 @@ async fn main() {
                     }
                     Some(ref s) if s.trim().eq_ignore_ascii_case("exit") => break,
                     Some(ref s) if s.trim().is_empty() => continue,
+                    Some(ref s) if s.trim().eq_ignore_ascii_case("suggest") => {
+                        let suggestions = get_suggestions().await;
+                        if suggestions.is_empty() {
+                            eprintln!("{}", "No suggestions available yet. Ask a question first.".yellow());
+                        } else {
+                            println!("{}", "💡 Follow-up questions:".green());
+                            for (i, sug) in suggestions.iter().enumerate() {
+                                println!("  {}. {}", i + 1, sug.cyan());
+                            }
+                        }
+                        continue;
+                    }
                     Some(s) => {
                         let trimmed = s.trim();
                         let lower = trimmed.to_ascii_lowercase();
