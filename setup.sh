@@ -310,16 +310,21 @@ setup_rc_alias() {
         *) rc="$HOME/.profile" ;;
     esac
 
-    # Add ask() function if not already present
+    # Add ask() and code() functions if not already present
     if ! grep -q "terminal_ai_agent" "$rc" 2>/dev/null; then
         cat >> "$rc" << 'EOF'
 
-# Terminal AI Agent — quick ask() shortcut
+# Terminal AI Agent — query mode (general Q&A)
 ask() {
     /usr/local/bin/terminal_ai_agent "$@"
 }
+
+# Terminal AI Agent — code mode (file ops, bash, project tasks)
+code() {
+    /usr/local/bin/terminal_ai_agent --code "$@"
+}
 EOF
-        echo -e "${GREEN}Added ask() to $rc for new terminals.${NC}"
+        echo -e "${GREEN}Added ask() and code() aliases to $rc for new terminals.${NC}"
     fi
 
     # Persist NVIDIA_API_KEY in shell rc if currently set (primary provider, no rate limits)
@@ -343,12 +348,17 @@ next_steps() {
     echo -e "${CYAN}========================================${NC}"
     echo ""
     echo -e "Run: ${CYAN}ask 'your question'${NC}"
+    echo -e "     ${CYAN}code 'create a Dockerfile'${NC}  (coding agent mode)"
+    echo ""
+    echo -e "Aliases added to your shell:"
+    echo -e "  ${CYAN}ask${NC}   query mode (general Q&A)"
+    echo -e "  ${CYAN}code${NC}  coding agent mode (files, bash, search)"
     echo ""
     echo -e "OpenCode gateway is running at ${CYAN}http://127.0.0.1:8083${NC}"
     echo -e "  → Free models available immediately: opencode/big-pickle, opencode/gpt-5-nano"
     echo ""
 
-    echo -e "${YELLOW}Recommended: Set your NVIDIA API key (production models, no rate limits)${NC}"
+    echo -e "${YELLOW}Recommended: Set NVIDIA_API_KEY for production models (no rate limits)${NC}"
     echo ""
     echo -e "  Get a key: ${CYAN}https://build.nvidia.com${NC}"
     echo ""
