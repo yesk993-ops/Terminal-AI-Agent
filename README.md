@@ -2,7 +2,7 @@
 
 # Terminal AI Agent
 
-**A fast, colorful AI agent for your terminal — powered by free models from 5 providers, with a built-in coding agent mode.**
+**A fast, colorful AI agent for your terminal — powered by free models from 5 providers, with ChatGPT-level features.**
 
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-dea584?logo=rust)](https://www.rust-lang.org)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -26,11 +26,17 @@ Key Benefits:
 ## Features
 
 - ⚡ **Parallel model racing** — queries across all providers simultaneously; fastest response wins
+- 🎯 **Streaming responses** — tokens appear in real-time as the model generates (ChatGPT-like experience)
 - 🤖 **Coding agent mode** (`--code`) — read, write, edit files; run bash commands; search code — all via natural language
-- 🎨 **Color-coded output** — bold green for key terms, green for headings, code blocks, inline commands, gold for acronyms
+- 🧠 **Chain-of-Thought reasoning** — models reason step-by-step for deeper, more accurate answers
+- 🔄 **Self-reflection** — after answering, the agent critiques and improves its own response in background
+- 💡 **Smart follow-up suggestions** — type `suggest` in REPL to see 2-3 relevant follow-up questions
+- 📦 **Response caching** — identical queries return instantly on repeat
+- 📁 **Project-aware context** — coding agent automatically scans your project structure
+- 🎨 **Color-coded output** — bold for key terms, headings, code blocks, inline commands, acronyms
 - 🆓 **Free models, no keys required** — built-in OpenCode gateway with zero-config free models
-- 🔑 **5 providers** — OpenRouter, Groq, Google Gemini, NVIDIA NIM, and local OpenCode gateway
-- 💬 **Conversation memory** — remembers last 6 turns, persisted across restarts
+- 🔑 **5 providers** — NVIDIA NIM, Groq, OpenRouter, Google Gemini, and local OpenCode gateway
+- 💬 **Conversation memory** — remembers context across turns, persisted across restarts
 - 📋 **Copy-friendly** — top/bottom border only, no side walls for easy copy-paste
 - 🔄 **REPL & single-shot** — interactive mode with `ask` or one-liner from shell
 - 🧵 **Graceful shutdown** — Ctrl+C saves conversation before exit
@@ -58,12 +64,16 @@ Works immediately — no API keys needed thanks to the built-in OpenCode gateway
 terminal_ai_agent "Explain monads in functional programming"
 ```
 
+### Streaming response
+When `GROQ_API_KEY` is set, tokens stream in real-time automatically:
+```bash
+terminal_ai_agent "What is the difference between Docker and Podman?"
+```
+
 ### Coding agent mode
 ```bash
 terminal_ai_agent --code "create a sample Dockerfile for a Rust web app"
 ```
-
-The coding agent can read, write, edit files, run bash commands, search code with grep, and glob for files — all through natural language.
 
 ### Custom temperature
 ```bash
@@ -75,6 +85,7 @@ terminal_ai_agent --temp 0.7 "Write a haiku about Rust"
 terminal_ai_agent
 > ask What is AWS Auto Scaling?
 > ask create a sample Dockerfile
+> suggest                    # see follow-up questions
 > exit
 ```
 
@@ -98,48 +109,53 @@ Then:
 ask What is the capital of France?
 ```
 
-## How it works
+## Environment variables
 
-```
-                     ┌──────────────────────┐
-                     │  OpenRouter          │
-                     │  Groq                │
-  ┌──────────┐       │  Google Gemini       │     ┌─────────┐
-  │  Query   │ ────▶ │  NVIDIA NIM          │ ──▶ │  Fastest │
-  │          │       │  OpenCode Gateway    │     │  answer  │
-  │  user    │       │  (free, no key)      │     │   wins   │
-  │  types   │       │                      │     │          │
-  └──────────┘       └──────────────────────┘     └─────────┘
-                     All models race in parallel
-                     (10s timeout each)
+### Setting API keys
+
+The agent reads API keys from environment variables at runtime — never stored in source code.
+
+#### Per-user (recommended)
+Add to `~/.bashrc`, `~/.zshrc`, or `~/.profile`:
+```bash
+export NVIDIA_API_KEY="nvapi-..."
+export GROQ_API_KEY="gsk_..."
+export OPENROUTER_API_KEY="sk-or-..."
 ```
 
-The agent fires requests to every configured provider simultaneously. The first model to return a valid response wins. If all fail, a helpful summary shows which errors occurred and suggests missing API keys.
-
-### Coding agent flow
-
-```
-  ┌──────────┐     ┌──────────────────────┐     ┌───────────┐
-  │  User    │ ──▶ │  Model races across  │ ──▶ │ Tool call │
-  │  prompt  │     │  all 5 providers     │     │ detected? │
-  └──────────┘     └──────────────────────┘     ─────┬──────
-                                                      │
-                                           yes        │        no
-                                            ┌─────────┘
-                                            ▼
-                                     ┌────────────┐
-                                     │  Execute    │
-                                     │  tool       │◀──── feedback loop
-                                     │  (bash,     │      (max 25 iters)
-                                     │   read,     │
-                                     │   write,    │
-                                     │   grep,     │
-                                     │   glob,     │
-                                     │   edit)     │
-                                     └────────────┘
+Reload:
+```bash
+source ~/.bashrc
 ```
 
-The coding agent (`--code`) uses text-based tool calling with `<tool_call>` tags — works with any model, no API-level function calling required.
+#### Global (all users)
+Add to `/etc/environment` or `/etc/profile.d/terminal-ai-agent.sh`:
+```bash
+# /etc/profile.d/terminal-ai-agent.sh
+export NVIDIA_API_KEY="nvapi-..."
+export GROQ_API_KEY="gsk_..."
+```
+
+### Available variables
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `NVIDIA_API_KEY` | Recommended | Primary production provider (1000+ RPM, no rate limits) |
+| `GROQ_API_KEY` | Optional | Fastest provider (~1-3s), enables **streaming** and **self-reflection** |
+| `OPENROUTER_API_KEY` | Optional | Fallback via free models from 5 providers |
+| `NVIDIA_QWEN_API_KEY` | Optional | Dedicated Qwen model via NVIDIA NIM |
+| `OPENROUTER_MODEL` | Optional | Override the default free model list with a specific model |
+
+### Setting a specific model
+```bash
+export OPENROUTER_MODEL="anthropic/claude-3.5-sonnet"
+```
+
+### Verify keys are set
+```bash
+echo "NVIDIA: ${NVIDIA_API_KEY:+set (${#NVIDIA_API_KEY} chars)}"
+echo "Groq: ${GROQ_API_KEY:+set (${#GROQ_API_KEY} chars)}"
+```
 
 ## Providers
 
@@ -152,7 +168,7 @@ The coding agent (`--code`) uses text-based tool calling with `<tool_call>` tags
 
 > **⭐ NVIDIA NIM is the recommended primary provider.** Production models with 1000+ RPM rate limits mean you will **never** see HTTP 429 errors. Get a free key at [build.nvidia.com](https://build.nvidia.com).
 
-The agent fires requests to all configured providers simultaneously via `FuturesUnordered` — the first valid response wins. With `NVIDIA_API_KEY` set, NVIDIA production models typically respond in 5-8 seconds with zero rate limit issues.
+**Groq is recommended as a secondary provider** — it's the fastest (~1-3s) and enables streaming responses and self-reflection.
 
 ### Getting API keys
 
@@ -163,27 +179,132 @@ The agent fires requests to all configured providers simultaneously via `Futures
 | OpenRouter | [openrouter.ai/keys](https://openrouter.ai/keys) | Optional fallback |
 | OpenCode Gateway | Built-in, no key needed | Zero-config free tier |
 
-Keys are **never** stored in source code — only read from environment variables at runtime.
+## How it works
+
+### Query mode
+
+```
+                      ┌──────────────────────┐
+                      │  Response Cache       │── hit → instant return
+                      └──────────┬───────────┘
+                                 │ miss
+                                 ▼
+  ┌──────────┐       ┌──────────────────────┐     ┌──────────────────┐
+  │  Query   │ ────▶ │  Streaming (Groq)    │──▶ │  Real-time tokens │
+  │          │       │  if key set           │     │  + horizontal    │
+  │  user    │       └──────────────────────┘     │  rule when done   │
+  │  types   │                                         │
+  │          │       ┌──────────────────────┐          │
+  └──────────┘───▶   │  Parallel racing     │──▶  │  First response  │
+                     │  (fallback)          │     │  wins → display  │
+                     │  NVIDIA + Groq + OR  │     └────────┬─────────┘
+                     └──────────────────────┘              │
+                                                            ▼
+                                                  ┌──────────────────────┐
+                                                  │  Background tasks:   │
+                                                  │  • Self-reflection   │
+                                                  │    (improve response)│
+                                                  │  • Follow-up         │
+                                                  │    suggestions       │
+                                                  └──────────────────────┘
+```
+
+The agent first checks the **response cache**. If the same query was asked before, it returns instantly.
+
+If `GROQ_API_KEY` is set, it tries **streaming** from Groq — tokens appear as the model generates them, similar to ChatGPT. After streaming finishes, background tasks improve the response further.
+
+If streaming is unavailable or fails, the agent falls back to **parallel model racing** — all providers queried simultaneously via `FuturesUnordered`. The first valid response wins.
+
+After every response, two background tasks run:
+1. **Self-reflection** — a fast model (Groq) critiques the response and produces an improved version, silently updating the conversation history
+2. **Follow-up suggestions** — generates 2-3 relevant follow-up questions, accessible via the `suggest` REPL command
+
+### Coding agent flow
+
+```
+  ┌──────────┐     ┌──────────────────────┐     ┌──────────────────────┐
+  │  User    │ ──▶ │  Project context     │──▶ │  Model races across  │
+  │  prompt  │     │  injected (file tree) │     │  all providers       │
+  └──────────┘     └──────────────────────┘     └──────────┬───────────┘
+                                                            │
+                                                            ▼
+                                                  ┌──────────────────────┐
+                                                  │  Tool call detected? │
+                                                  │  (native or text)    │
+                                                  └──────┬───────┬───────┘
+                                                    yes   │       │  no
+                                                  ┌───────┘       └──────▶  Print
+                                                  ▼                       response
+                                      ┌──────────────────────────┐
+                                      │  Duplicate check         │
+                                      │  (skip if same tool+args) │
+                                      │  + shell quoting fix     │
+                                      └──────────┬───────────────┘
+                                                  ▼
+                                      ┌──────────────────────┐
+                                      │  Execute tool         │
+                                      │  (bash, read, write,  │
+                                      │   grep, glob, edit)   │
+                                      └──────────┬───────────┘
+                                                  │
+                                                  ▼
+                                      ┌──────────────────────┐
+                                      │  Inject result +      │
+                                      │  remaining checklist  │
+                                      │  Trim context if      │
+                                      │  > 50 messages        │
+                                      └──────────┬───────────┘
+                                                  │
+                                                  ▼
+                                        Loop (max 40 iters)
+                                        until no tool call
+```
+
+The coding agent (`--code`) follows a structured workflow:
+
+1. **Project context injection** — before processing, the agent scans your current directory and injects a project summary (files, line counts) as context
+2. **Model query** — all providers race to produce a tool call or answer
+3. **Duplicate detection** — repeated identical tool calls are blocked to prevent infinite loops
+4. **Shell quoting fix** — common LLM quoting mistakes (e.g., `mkdir -p '{a,b}'`) are automatically corrected
+5. **Context management** — at 50+ messages, tool results are truncated and project context is preserved
+6. **Up to 40 iterations** — sufficient for complex multi-file projects
+
+### Quality features
+
+| Feature | What it does | Speed impact |
+|---|---|---|
+| **Chain-of-Thought prompting** | Models reason step-by-step for deeper, more accurate responses | Zero |
+| **Streaming** (Groq) | Tokens arrive in real-time as the model generates | None (faster perceived speed) |
+| **Self-reflection** | After display, Groq critiques and improves the response in background | None (async) |
+| **Response cache** | Same (query, temperature) returns instantly on repeat | Positive |
+| **Follow-up suggestions** | 2-3 relevant questions generated in background | None (async) |
+| **Temperature auto-tune** | 0.2 factual, 0.4 code, 0.8 creative — auto-detected from query | Zero |
+| **Response scoring** | Heuristic quality check discards low-quality responses | Zero |
+| **Post-processing** | Strips filler phrases, normalizes formatting | Zero |
 
 ## Color reference
 
 | Element | ANSI code | Sample |
 |---|---|---|
-| **Bold key terms** `**text**` | `\x1b[1;32m` (bold green) | **key concept** |
-| Headings `### Title` | `\x1b[32m` (green) | Section heading |
-| Code blocks `` ``` `` | `\x1b[0;32m` (green) | Multi-line code |
-| Inline commands `` `cmd` `` | `\x1b[0;32m` (green) | Commands, flags, paths |
-| Shell prompts `$ cmd` | `\x1b[0;32m` (green) | Command-line examples |
-| Acronyms `API (...)` | `\x1b[38;5;220m` (gold) | Acronym definitions |
+| **Bold key terms** `**text**` | `\x1b[1;37m` (bold white) | **key concept** |
+| Headings `### Title` | `\x1b[0;92m` (light green) | Section heading |
+| Code blocks `` ``` `` | `\x1b[0;33m` (gold) | Multi-line code |
+| Inline commands `` `cmd` `` | `\x1b[0;33m` (gold) | Commands, flags, paths |
+| Shell prompts `$ cmd` | `\x1b[0;94m` (blue) | Command-line examples |
+| Acronyms `API (...)` | `\x1b[33m` (gold) | Acronym definitions |
 | Border | `\x1b[36m` (cyan) | Top/bottom horizontal rule |
+| Table headers | `\x1b[1;93m` (bold yellow) | Table column headers |
+| Table data | `\x1b[0;37m` (white) / `\x1b[0;90m` (gray) | Alternating row colors |
 
 ## Project structure
 
 ```
 src/
-  lib.rs    — core library: types, API calls, formatting, conversation, tests
-  main.rs   — binary entry point: CLI parsing, REPL loop
-  tools.rs  — coding agent tools: read, write, edit, bash, grep, glob, list_dir
+  lib.rs    — core library: types, API calls, formatting, conversation,
+              caching, streaming, self-reflection, follow-ups, project context
+  main.rs   — binary entry point: CLI parsing, REPL loop with suggest command
+  tools.rs  — coding agent tools: read, write, edit, bash (with quoting fix),
+              grep, glob, list_dir
 setup.sh    — one-command installer (auto-detects OS, installs deps + builds)
 INSTALL.md  — platform-specific installation guide
 ```
@@ -202,6 +323,8 @@ cargo build --release
 ```bash
 cargo test
 ```
+
+59 unit tests covering formatting, conversation, scoring, table rendering, and all 7 coding tools.
 
 ## License
 
