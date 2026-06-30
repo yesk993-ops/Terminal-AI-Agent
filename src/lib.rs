@@ -164,6 +164,7 @@ static GROQ_MODELS: &[&str] = &[
 static NVIDIA_MODELS: &[&str] = &[
     "meta/llama-3.1-8b-instruct",
     "deepseek-ai/deepseek-v4-pro",
+    "openai/gpt-oss-120b",
     "mistralai/mistral-small-4-119b-2603",
 ];
 

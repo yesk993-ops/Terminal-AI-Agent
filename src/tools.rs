@@ -342,46 +342,49 @@ async fn exec_grep(args: &Value) -> String {
     let include = args.get("include").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     let pattern = pattern.to_string();
-    let result = tokio::task::spawn_blocking(move || {
-        // Try ripgrep first (fastest), fall back to grep -rn
-        let has_rg = StdCommand::new("rg")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .ok()
-            .map(|s| s.success())
-            .unwrap_or(false);
+    let result = timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            // Try ripgrep first (fastest), fall back to grep -rn
+            let has_rg = StdCommand::new("rg")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .ok()
+                .map(|s| s.success())
+                .unwrap_or(false);
 
-        if has_rg {
-            let mut cmd = StdCommand::new("rg");
-            cmd.arg("-n");
+            if has_rg {
+                let mut cmd = StdCommand::new("rg");
+                cmd.arg("-n");
+                if let Some(ref inc) = include {
+                    cmd.arg("--glob");
+                    cmd.arg(inc);
+                }
+                cmd.arg(&pattern);
+                cmd.arg(&path);
+                cmd.arg("-m").arg("50");
+                return cmd.output();
+            }
+
+            // Fallback: use grep -rn with --include if needed
+            let mut cmd = StdCommand::new("grep");
+            cmd.arg("-rn");
             if let Some(ref inc) = include {
-                cmd.arg("--glob");
+                cmd.arg("--include");
                 cmd.arg(inc);
             }
             cmd.arg(&pattern);
             cmd.arg(&path);
             cmd.arg("-m").arg("50");
-            return cmd.output();
-        }
-
-        // Fallback: use grep -rn with --include if needed
-        let mut cmd = StdCommand::new("grep");
-        cmd.arg("-rn");
-        if let Some(ref inc) = include {
-            cmd.arg("--include");
-            cmd.arg(inc);
-        }
-        cmd.arg(&pattern);
-        cmd.arg(&path);
-        cmd.arg("-m").arg("50");
-        cmd.output()
-    })
+            cmd.output()
+        }),
+    )
     .await;
 
     match result {
-        Ok(Ok(out)) => {
+        Ok(Ok(Ok(out))) => {
             let mut result = String::new();
             if !out.stdout.is_empty() {
                 result.push_str(&String::from_utf8_lossy(&out.stdout));
@@ -401,8 +404,9 @@ async fn exec_grep(args: &Value) -> String {
             }
             result
         }
-        Ok(Err(e)) => format!("grep error: {}", e),
-        Err(_) => "Failed to spawn grep command".to_string(),
+        Ok(Ok(Err(e))) => format!("grep error: {}", e),
+        Ok(Err(_)) => "Failed to spawn grep command".to_string(),
+        Err(_) => "grep timed out after 30s".to_string(),
     }
 }
 
@@ -423,34 +427,38 @@ async fn exec_glob(args: &Value) -> String {
         format!("{}/{}", path.trim_end_matches('/'), pattern.trim_start_matches('/'))
     };
 
-    match tokio::task::spawn_blocking(move || {
-        let mut results: Vec<String> = Vec::new();
-        match glob_match(&full_pattern) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    results.push(entry.to_string_lossy().to_string());
+    match timeout(
+        Duration::from_secs(15),
+        tokio::task::spawn_blocking(move || {
+            let mut results: Vec<String> = Vec::new();
+            match glob_match(&full_pattern) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        results.push(entry.to_string_lossy().to_string());
+                    }
+                    results.sort();
+                    if results.is_empty() {
+                        "(no matches)".to_string()
+                    } else if results.len() > 100 {
+                        let truncated: Vec<String> = results[..100].to_vec();
+                        format!(
+                            "{}\n... ({} more matches)",
+                            truncated.join("\n"),
+                            results.len() - 100
+                        )
+                    } else {
+                        results.join("\n")
+                    }
                 }
-                results.sort();
-                if results.is_empty() {
-                    "(no matches)".to_string()
-                } else if results.len() > 100 {
-                    let truncated: Vec<String> = results[..100].to_vec();
-                    format!(
-                        "{}\n... ({} more matches)",
-                        truncated.join("\n"),
-                        results.len() - 100
-                    )
-                } else {
-                    results.join("\n")
-                }
+                Err(e) => format!("Glob error: {}", e),
             }
-            Err(e) => format!("Glob error: {}", e),
-        }
-    })
+        }),
+    )
     .await
     {
-        Ok(result) => result,
-        Err(_) => "Failed to spawn glob task".to_string(),
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => "Failed to spawn glob task".to_string(),
+        Err(_) => "glob timed out after 15s".to_string(),
     }
 }
 
