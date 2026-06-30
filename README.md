@@ -34,7 +34,7 @@ Key Benefits:
 - 📦 **Response caching** — identical queries return instantly on repeat
 - 📁 **Project-aware context** — coding agent automatically scans your project structure
 - 🎨 **Color-coded output** — bold for key terms, headings, code blocks, inline commands, acronyms
- - 🔑 **3 providers** — NVIDIA NIM ⭐, Groq, and OpenRouter
+ - 🔑 **4 providers** — NVIDIA NIM ⭐, Groq, OpenRouter, and dedicated Qwen model
 - 💬 **Conversation memory** — remembers context across turns, persisted across restarts
 - 📋 **Copy-friendly** — top/bottom border only, no side walls for easy copy-paste
 - 🔄 **REPL & single-shot** — interactive mode with `ask` or one-liner from shell
@@ -172,7 +172,7 @@ echo "Groq: ${GROQ_API_KEY:+set (${#GROQ_API_KEY} chars)}"
 
 | Provider | Env var | Key required | Models | Rate limits |
 |---|---|---|---|---|
-| **NVIDIA NIM** ⭐ | `NVIDIA_API_KEY` | Yes | `deepseek-ai/deepseek-v4-pro`, `mistralai/mistral-small-4-119b-2603`, `meta/llama-3.1-8b-instruct` | **1000+ RPM** (no 429s) |
+| **NVIDIA NIM** ⭐ | `NVIDIA_API_KEY` | Yes | `deepseek-ai/deepseek-v4-pro`, `openai/gpt-oss-120b`, `mistralai/mistral-small-4-119b-2603`, `meta/llama-3.1-8b-instruct` | **1000+ RPM** (no 429s) |
  | Groq | `GROQ_API_KEY` | Yes | `llama-3.3-70b-versatile` | 30 RPM (free tier) |
  | OpenRouter | `OPENROUTER_API_KEY` | Yes | `:free` models from multiple providers | 1-5 RPM (free tier) |
 
@@ -276,7 +276,8 @@ The coding agent (`--code`) follows a structured workflow:
 3. **Duplicate detection** — repeated identical tool calls are blocked to prevent infinite loops
 4. **Shell quoting fix** — common LLM quoting mistakes (e.g., `mkdir -p '{a,b}'`) are automatically corrected
 5. **Context management** — at 50+ messages, tool results are truncated and project context is preserved
-6. **Up to 40 iterations** — sufficient for complex multi-file projects
+6. **Tool timeouts** — grep (30s), glob (15s), bash (30s) — prevents agent hangs on slow commands
+7. **Up to 40 iterations** — sufficient for complex multi-file projects
 
 ### Quality features
 
@@ -333,7 +334,20 @@ cargo build --release
 cargo test
 ```
 
-59 unit tests covering formatting, conversation, scoring, table rendering, and all 7 coding tools.
+95+ unit tests covering formatting, conversation, scoring, table rendering, and all 7 coding tools.
+
+## Benchmark
+
+Query and coding agent performance with NVIDIA NIM + Groq:
+
+| Test Type | Avg Time | Fastest | Slowest |
+|-----------|----------|---------|---------|
+| Simple queries (Q&A) | ~1s | 0.5s | 1.5s |
+| Complex queries (tables, comparisons) | ~5s | 4s | 7s |
+| Simple code tasks (bash, read file) | ~16s | 12s | 20s |
+| Complex code tasks (multi-file, multi-step) | ~20s | 18s | 22s |
+
+All tests ran with a 120s per-query timeout. Zero failures across query and code modes.
 
 ## License
 
