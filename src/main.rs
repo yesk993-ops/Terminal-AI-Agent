@@ -58,9 +58,9 @@ fn print_help() {
     println!("  terminal_ai_agent                (starts REPL mode)");
     println!();
     println!("PROVIDERS:");
-    println!("  OpenRouter, Groq, Google Gemini, NVIDIA NIM, OpenCode Gateway");
-    println!("  Set API keys via environment variables:");
-    println!("    OPENROUTER_API_KEY, GROQ_API_KEY, GOOGLE_API_KEY, NVIDIA_API_KEY");
+    println!(" NVIDIA NIM, Groq, OpenRouter");
+    println!(" Set API keys via environment variables:");
+    println!(" NVIDIA_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY");
     println!();
     println!("REPL COMMANDS:");
     println!("  ask <question>        Send a query to the AI");

@@ -34,8 +34,7 @@ Key Benefits:
 - 📦 **Response caching** — identical queries return instantly on repeat
 - 📁 **Project-aware context** — coding agent automatically scans your project structure
 - 🎨 **Color-coded output** — bold for key terms, headings, code blocks, inline commands, acronyms
-- 🆓 **Free models, no keys required** — built-in OpenCode gateway with zero-config free models
-- 🔑 **5 providers** — NVIDIA NIM, Groq, OpenRouter, Google Gemini, and local OpenCode gateway
+ - 🔑 **3 providers** — NVIDIA NIM ⭐, Groq, and OpenRouter
 - 💬 **Conversation memory** — remembers context across turns, persisted across restarts
 - 📋 **Copy-friendly** — top/bottom border only, no side walls for easy copy-paste
 - 🔄 **REPL & single-shot** — interactive mode with `ask` or one-liner from shell
@@ -47,13 +46,13 @@ Key Benefits:
 curl -fsSL https://raw.githubusercontent.com/yesk993-ops/Terminal-AI-Agent/main/setup.sh | bash
 ```
 
-The script auto-detects your OS, installs Rust, Node.js, and the OpenCode gateway (free models with no API key), builds the project, and installs the binary. After it finishes:
+The script auto-detects your OS, installs Rust, and builds the project. After it finishes:
 
 ```bash
 ask "What is Rust?"
 ```
 
-Works immediately — no API keys needed thanks to the built-in OpenCode gateway.
+Works immediately — set `NVIDIA_API_KEY` for the best experience (no rate limits, free tier at build.nvidia.com). OpenRouter `:free` models work without a key.
 
 > For detailed platform-specific instructions, see [INSTALL.md](INSTALL.md).
 
@@ -174,9 +173,8 @@ echo "Groq: ${GROQ_API_KEY:+set (${#GROQ_API_KEY} chars)}"
 | Provider | Env var | Key required | Models | Rate limits |
 |---|---|---|---|---|
 | **NVIDIA NIM** ⭐ | `NVIDIA_API_KEY` | Yes | `deepseek-ai/deepseek-v4-pro`, `mistralai/mistral-small-4-119b-2603`, `meta/llama-3.1-8b-instruct` | **1000+ RPM** (no 429s) |
-| Groq | `GROQ_API_KEY` | Yes | `llama-3.3-70b-versatile` | 30 RPM (free tier) |
-| OpenRouter | `OPENROUTER_API_KEY` | Yes | `:free` models from 5 providers | 1-5 RPM (free tier) |
-| OpenCode Gateway | — | **No** | `big-pickle`, `gpt-5-nano` | varies |
+ | Groq | `GROQ_API_KEY` | Yes | `llama-3.3-70b-versatile` | 30 RPM (free tier) |
+ | OpenRouter | `OPENROUTER_API_KEY` | Yes | `:free` models from multiple providers | 1-5 RPM (free tier) |
 
 > **⭐ NVIDIA NIM is the recommended primary provider.** Production models with 1000+ RPM rate limits mean you will **never** see HTTP 429 errors. Get a free key at [build.nvidia.com](https://build.nvidia.com).
 
@@ -187,9 +185,8 @@ echo "Groq: ${GROQ_API_KEY:+set (${#GROQ_API_KEY} chars)}"
 | Provider | Where to get | Recommended? |
 |---|---|---|
 | **NVIDIA NIM** | [build.nvidia.com](https://build.nvidia.com) | **✅ Primary (no rate limits)** |
-| Groq | [console.groq.com/keys](https://console.groq.com/keys) | Optional fallback |
-| OpenRouter | [openrouter.ai/keys](https://openrouter.ai/keys) | Optional fallback |
-| OpenCode Gateway | Built-in, no key needed | Zero-config free tier |
+ | Groq | [console.groq.com/keys](https://console.groq.com/keys) | Optional fallback |
+ | OpenRouter | [openrouter.ai/keys](https://openrouter.ai/keys) | Optional fallback |
 
 ## How it works
 

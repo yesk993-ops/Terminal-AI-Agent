@@ -971,6 +971,7 @@ dependencies = [
  "colored",
  "futures-util",
  "glob",
+ "indexmap",
  "regex",
  "reqwest",
  "serde",

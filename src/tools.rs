@@ -281,6 +281,15 @@ async fn exec_bash(args: &Value) -> String {
     };
     let cmd = fix_shell_quoting(cmd);
 
+    // Deny-list safety check: block known dangerous commands
+    let cmd_lower = cmd.to_lowercase();
+    let dangerous = ["rm -rf /", ":(){ :|:& };:", "mkfs", "dd if="];
+    for pat in dangerous {
+        if cmd_lower.contains(pat) {
+            return format!("Blocked dangerous command: {}", pat);
+        }
+    }
+
     let output = timeout(
         Duration::from_secs(30),
         tokio::task::spawn_blocking(move || {

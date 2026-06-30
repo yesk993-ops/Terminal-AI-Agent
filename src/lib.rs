@@ -1414,7 +1414,8 @@ fn jitter_ms(base_ms: u64) -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos();
-    let offset = (nanos % (base_ms as u32 / 2)).max(1) as u64;
+    let divisor = (base_ms as u32 / 2).max(1);
+    let offset = (nanos % divisor) as u64;
     if nanos % 2 == 0 {
         base_ms + offset
     } else {
@@ -1620,7 +1621,8 @@ pub async fn process_query(
     push_conversation(user_msg.clone()).await;
 
     // Try streaming first (Groq) for ChatGPT-like real-time experience
-    if let Some(streamed) = try_stream_response(client, query, &msg_vec, effective_temp, max_tokens).await {
+    // 120s timeout to prevent indefinite hangs; falls back to parallel racing on timeout
+    if let Some(streamed) = timeout(Duration::from_secs(120), try_stream_response(client, query, &msg_vec, effective_temp, max_tokens)).await.ok().flatten() {
         cache_put(query, effective_temp, &streamed);
         let assistant = ChatMessage {
             role: "assistant".to_string(),

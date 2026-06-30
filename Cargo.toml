@@ -31,5 +31,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 colored = "2.0"
 regex = "1"
-glob = "0.3"
+    indexmap = "2"
+    glob = "0.3"
 textwrap = { version = "0.16", features = ["terminal_size"] }
