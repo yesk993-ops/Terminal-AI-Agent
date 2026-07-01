@@ -166,6 +166,7 @@ static NVIDIA_MODELS: &[&str] = &[
     "deepseek-ai/deepseek-v4-pro",
     "openai/gpt-oss-120b",
     "mistralai/mistral-small-4-119b-2603",
+    "nvidia/nemotron-3-super-120b-a12b",
 ];
 
 /// Qwen model via NVIDIA NIM — uses its own dedicated API key.
@@ -226,6 +227,7 @@ async fn call_api(
     max_tokens: u32,
     tools: Option<Vec<Tool>>,
     tool_choice: Option<ToolChoice>,
+    extra_body: Option<Value>,
 ) -> Result<ChatMessage, ApiError> {
     // Build JSON body directly from references — avoids cloning the entire message list
     let mut body = serde_json::json!({
@@ -240,6 +242,13 @@ async fn call_api(
     }
     if let Some(tc) = tool_choice {
         body["tool_choice"] = serde_json::json!(tc);
+    }
+    if let Some(ref eb) = extra_body {
+        if let Some(obj) = eb.as_object() {
+            for (k, v) in obj {
+                body[k] = v.clone();
+            }
+        }
     }
 
     let req = client
@@ -307,6 +316,7 @@ pub async fn call_openrouter(
     max_tokens: u32,
     tools: Option<Vec<Tool>>,
     tool_choice: Option<ToolChoice>,
+    extra_body: Option<Value>,
 ) -> Result<ChatMessage, ApiError> {
     call_api(
         client,
@@ -322,6 +332,7 @@ pub async fn call_openrouter(
         max_tokens,
         tools,
         tool_choice,
+        extra_body,
     )
     .await
 }
@@ -336,6 +347,7 @@ pub async fn call_groq(
     max_tokens: u32,
     tools: Option<Vec<Tool>>,
     tool_choice: Option<ToolChoice>,
+    extra_body: Option<Value>,
 ) -> Result<ChatMessage, ApiError> {
     call_api(
         client,
@@ -347,6 +359,7 @@ pub async fn call_groq(
         max_tokens,
         tools,
         tool_choice,
+        extra_body,
     )
     .await
 }
@@ -363,7 +376,19 @@ pub async fn call_nvidia(
     max_tokens: u32,
     tools: Option<Vec<Tool>>,
     tool_choice: Option<ToolChoice>,
+    extra_body: Option<Value>,
 ) -> Result<ChatMessage, ApiError> {
+    // Auto-add thinking params for nemotron models to enable chain-of-thought reasoning
+    let eb = extra_body.or_else(|| {
+        if model.contains("nemotron") || model.contains("nemotron-3") {
+            Some(serde_json::json!({
+                "chat_template_kwargs": {"enable_thinking": true},
+                "reasoning_budget": 16384
+            }))
+        } else {
+            None
+        }
+    });
     call_api(
         client,
         "https://integrate.api.nvidia.com/v1/chat/completions",
@@ -374,6 +399,7 @@ pub async fn call_nvidia(
         max_tokens,
         tools,
         tool_choice,
+        eb,
     )
     .await
 }
@@ -555,7 +581,7 @@ async fn generate_followups(client: &Client, query: &str, response: &str) -> Vec
 
     let gk = get_groq_key();
     if let Ok(ref key) = gk {
-        if let Ok(result) = call_groq(client, key.clone(), "llama-3.3-70b-versatile", &msgs, 0.5, 256, None, None).await {
+        if let Ok(result) = call_groq(client, key.clone(), "llama-3.3-70b-versatile", &msgs, 0.5, 256, None, None, None).await {
             if let Some(content) = result.content {
                 let parsed = parse_json_array(&content);
                 if !parsed.is_empty() {
@@ -605,7 +631,7 @@ async fn self_reflect(client: &Client, query: &str, response: &str) -> Option<St
 
     let gk = get_groq_key();
     let key = gk.as_ref().ok()?;
-    let result = call_groq(client, key.clone(), "llama-3.3-70b-versatile", &msgs, 0.3, 1024, None, None).await.ok()?;
+    let result = call_groq(client, key.clone(), "llama-3.3-70b-versatile", &msgs, 0.3, 1024, None, None, None).await.ok()?;
     let content = result.content?;
     let trimmed = content.trim().to_string();
 
@@ -757,6 +783,11 @@ fn inline_code_re() -> &'static Regex {
     &RE
 }
 
+fn strip_star_hash_re() -> &'static Regex {
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[*#]").unwrap());
+    &RE
+}
+
 fn shell_cmd_re() -> &'static Regex {
     static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\$\s+").unwrap());
     &RE
@@ -867,39 +898,10 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
         }
     }
 
-    let a_re = ansi_re();
-    let ic_re = inline_code_re();
-    let b_re = bold_re();
-
-    // Helper: render a single line of a cell with ANSI formatting and padding
-    let format_cell_line = |line: &str, width: usize, is_header: bool, row_index: usize| -> String {
-        // Apply inline formatting (bold, inline code) within this line
-        let mut processed = ic_re
-            .replace_all(line, |caps: &regex::Captures| {
-                format!("[0;33m{}[0m", &caps[1])
-            })
-            .to_string();
-        {
-            let bold_color = if is_header { "93" } else { "33" };
-            processed = b_re
-                .replace_all(&processed, |caps: &regex::Captures| {
-                    format!("[1;{}m{}[0m", bold_color, &caps[1])
-                })
-                .to_string();
-        }
-
-        // Strip ANSI for width calculation, pad, then re-apply color
-        let stripped = a_re.replace_all(&processed, "").to_string();
-        let pad = width.saturating_sub(stripped.chars().count());
-        let padded = format!(" {} {:pad$} ", processed, "", pad = pad);
-
-        if is_header {
-            format!("[1;93m{}[0m", padded)
-        } else {
-            // Alternating row colors for readability
-            let row_color = if row_index % 2 == 0 { "[0;37m" } else { "[0;90m" };
-            format!("{}{}[0m", row_color, padded)
-        }
+    // Helper: render a single line of a cell with padding
+    let format_cell_line = |line: &str, width: usize, _is_header: bool, _row_index: usize| -> String {
+        let pad = width.saturating_sub(line.chars().count());
+        format!(" {} {:pad$} ", line, "", pad = pad)
     };
 
     // Word-wrap each cell's content to its column width.
@@ -931,22 +933,20 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
         row_heights.push(max_lines_for_row);
     }
 
-    // Helper: build a horizontal rule
-    let hrule = |left: &str, mid: &str, right: &str| -> String {
-        let mut s = String::from(left);
-        for (i, w) in col_widths.iter().enumerate() {
-            s.push_str(&"─".repeat(*w + 2));
-            if i < col_count - 1 {
-                s.push_str(mid);
-            }
+    // Helper: build an ASCII horizontal rule (accepts legacy args for compatibility)
+    let hrule = |_: &str, _: &str, _: &str| -> String {
+        let mut s = String::new();
+        s.push('+');
+        for (_i, w) in col_widths.iter().enumerate() {
+            s.push_str(&"-".repeat(*w + 2));
+            s.push('+');
         }
-        s.push_str(right);
         s
     };
 
     let mut out = String::new();
 
-    // Top border
+    // Top border (ASCII)
     out.push_str(&format!("[36m{}[0m
 ", hrule("┌", "┬", "┐")));
 
@@ -956,7 +956,7 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
 
         // Render each text line of this row (multi-line cells span multiple lines)
         for line_idx in 0..row_height {
-            out.push('│');
+            out.push('|');
             for cell_idx in 0..col_count {
                 let col_w = col_widths[cell_idx];
                 let cell_lines = &wrapped_lines[row_idx][cell_idx];
@@ -967,7 +967,7 @@ fn format_table_rows(rows: &[&str], term_w: usize) -> String {
                 };
                 let rendered = format_cell_line(cell_text, col_w, is_header, row_idx);
                 out.push_str(&rendered);
-                out.push('│');
+                out.push('|');
             }
             out.push('\n');
         }
@@ -1006,6 +1006,7 @@ pub fn format_response(resp: &str) -> String {
     let sc_re = shell_cmd_re();
     let ac_re = acronym_re();
     let a_re = ansi_re();
+    let strip_re = strip_star_hash_re();
     let mut in_code = false;
     // Buffer for table rows (markdown tables are consecutive |...| lines)
     let mut table_buf: Vec<&str> = Vec::new();
@@ -1037,10 +1038,8 @@ pub fn format_response(resp: &str) -> String {
         }
 
         if in_code {
-            let wrapped: Vec<String> = wrap(raw_line, inner_w)
-                .into_iter()
-                .map(|s| format!("\x1b[0;33m{}\x1b[0m", s))
-                .collect();
+            // Code blocks: keep as plain text (no colors)
+            let wrapped: Vec<String> = wrap(raw_line, inner_w).into_iter().map(|s| s.to_string()).collect();
             lines.extend(wrapped);
             continue;
         }
@@ -1054,12 +1053,12 @@ pub fn format_response(resp: &str) -> String {
         // If we were building a table and this line isn't a table row, flush
         flush_table(&mut table_buf, &mut lines, term_w);
 
-        let is_heading = trimmed.starts_with("### ")
+        let _is_heading = trimmed.starts_with("### ")
             || trimmed.starts_with("## ")
             || trimmed.starts_with("# ");
-        let is_bullet = trimmed.starts_with("- ") || trimmed.starts_with("* ");
-        let is_shell_cmd = sc_re.is_match(raw_line);
-        let is_acronym = ac_re.is_match(raw_line);
+        let _is_bullet = trimmed.starts_with("- ") || trimmed.starts_with("* ");
+        let _is_shell_cmd = sc_re.is_match(raw_line);
+        let _is_acronym = ac_re.is_match(raw_line);
 
         let raw_stripped = h_re.replace_all(raw_line, "");
         let raw_stripped = list_star_re().replace_all(&raw_stripped, "");
@@ -1071,32 +1070,11 @@ pub fn format_response(resp: &str) -> String {
 
         for sub in wrapped {
             let mut processed = sub;
-            if is_heading {
-                // Headings: light green
-                processed = format!("\x1b[0;92m{}\x1b[0m", processed);
-            } else if is_bullet {
-                // Bullet points: light green
-                processed = format!("\x1b[0;92m{}\x1b[0m", processed);
-            }
-            if is_shell_cmd {
-                processed = format!("\x1b[0;94m{}\x1b[0m", processed);
-            }
-            processed = ic_re
-                .replace_all(&processed, |caps: &regex::Captures| {
-                    format!("\x1b[0;33m{}\x1b[0m", &caps[1])
-                })
-                .to_string();
-            processed = b_re
-                .replace_all(&processed, |caps: &regex::Captures| {
-                    // Bold text: bold gold/yellow for key terms, gold for acronyms
-                    let color = if is_acronym { "33" } else { "33" };
-                    format!("\x1b[1;{}m{}\x1b[0m", color, &caps[1])
-                })
-                .to_string();
-            if is_acronym {
-                // Wrap entire line in gold WITHOUT stripping inner ANSI formatting
-                processed = format!("\x1b[33m{}\x1b[0m", processed);
-            }
+            // Remove markdown formatting without colors
+            processed = ic_re.replace_all(&processed, "$1").to_string();
+            processed = b_re.replace_all(&processed, "$1").to_string();
+            // Strip any remaining * or # characters
+            processed = strip_re.replace_all(&processed, "").to_string();
             lines.push(processed);
         }
     }
@@ -1108,7 +1086,8 @@ pub fn format_response(resp: &str) -> String {
         lines.push(String::new());
     }
 
-    let hline = format!("\x1b[36m{}\x1b[0m", "─".repeat(inner_w + 2));
+    // Simple horizontal line for top/bottom border (ASCII)
+    let hline = "-".repeat(inner_w + 2);
     let mut out = String::new();
     out.push_str(&format!("{}\n", hline));
     for line in &lines {
@@ -1116,7 +1095,7 @@ pub fn format_response(resp: &str) -> String {
         let pad = inner_w - stripped.chars().count().min(inner_w);
         out.push_str(&format!("{} {:pad$}\n", line, "", pad = pad));
     }
-    out.push_str(&hline.to_string());
+    out.push_str(&hline);
     out
 }
 
@@ -1554,7 +1533,120 @@ async fn try_stream_response(
     // Print horizontal rule to match format_response style
     let term_w = safe_termwidth();
     let inner_w = term_w.saturating_sub(2).max(20);
-    println!("\x1b[36m{}\x1b[0m", "─".repeat(inner_w + 2));
+    println!("{}", "-".repeat(inner_w + 2));
+
+    Some(post_process_response(&full_content))
+}
+
+/// Streams a response from NVIDIA nemotron with thinking support, printing
+/// reasoning tokens (dimmed) and content tokens as they arrive.
+/// Falls back gracefully to Groq streaming or parallel racing on any error.
+async fn try_stream_nvidia(
+    client: &Client,
+    messages: &[ChatMessage],
+    temperature: f32,
+    max_tokens: u32,
+) -> Option<String> {
+    let nk = get_nvidia_key();
+    if nk.is_empty() {
+        return None;
+    }
+
+    let body = serde_json::json!({
+        "model": "nvidia/nemotron-3-super-120b-a12b",
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": true,
+        "chat_template_kwargs": {"enable_thinking": true},
+        "reasoning_budget": 16384,
+    });
+
+    let req = client
+        .post("https://integrate.api.nvidia.com/v1/chat/completions")
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "TerminalAI-Agent/0.1.0")
+        .header("Authorization", format!("Bearer {}", nk))
+        .json(&body);
+
+    let resp = match req.send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return None,
+    };
+
+    // Show a subtle waiting indicator (overwritten by first token)
+    print!("{}", "   ".dimmed());
+    let _ = std::io::stdout().flush();
+
+    let mut full_content = String::new();
+    let mut stream = resp.bytes_stream();
+    let mut first_token = true;
+    let mut in_thinking = false;
+
+    use futures_util::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(_) => break,
+        };
+        let text = String::from_utf8_lossy(&chunk);
+
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.starts_with("data: ") {
+                continue;
+            }
+            let data = &line[6..];
+            if data == "[DONE]" {
+                break;
+            }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(choices) = val.get("choices").and_then(|c| c.as_array()) {
+                    if let Some(choice) = choices.first() {
+                        if let Some(delta) = choice.get("delta") {
+                            // Print reasoning content (chain-of-thought) in dimmed style
+                            if let Some(rc) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+                                if !rc.is_empty() {
+                                    if first_token {
+                                        first_token = false;
+                                    }
+                                    if !in_thinking {
+                                        in_thinking = true;
+                                    }
+                                    print!("{}", rc.dimmed());
+                                    std::io::stdout().flush().ok();
+                                }
+                            }
+                            // Print actual response content normally
+                            if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                if first_token {
+                                    first_token = false;
+                                }
+                                // If we were in thinking mode and now have content, print separator
+                                if in_thinking {
+                                    in_thinking = false;
+                                    // Print a brief separator between thinking and content
+                                }
+                                full_content.push_str(content);
+                                print!("{}", content);
+                                std::io::stdout().flush().ok();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if full_content.is_empty() {
+        return None;
+    }
+
+    println!();
+    // Print horizontal rule to match format_response style
+    let term_w = safe_termwidth();
+    let inner_w = term_w.saturating_sub(2).max(20);
+    println!("{}", "-".repeat(inner_w + 2));
 
     Some(post_process_response(&full_content))
 }
@@ -1621,8 +1713,53 @@ pub async fn process_query(
 
     push_conversation(user_msg.clone()).await;
 
-    // Try streaming first (Groq) for ChatGPT-like real-time experience
-    // 120s timeout to prevent indefinite hangs; falls back to parallel racing on timeout
+    // Try NVIDIA nemotron streaming first (strongest model with thinking support)
+    // 120s timeout; falls back to Groq streaming then parallel racing
+    if !nk.is_empty() {
+        if let Some(streamed) = timeout(Duration::from_secs(120), try_stream_nvidia(client, &msg_vec, effective_temp, max_tokens)).await.ok().flatten() {
+            cache_put(query, effective_temp, &streamed);
+            let assistant = ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(streamed.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+            };
+            push_conversation(assistant).await;
+            save_conversation().await;
+
+            // Background follow-ups
+            let fc = client.clone();
+            let fq = query.to_string();
+            let fr = streamed.clone();
+            tokio::spawn(async move {
+                let suggestions = generate_followups(&fc, &fq, &fr).await;
+                *FOLLOW_UP_SUGGESTIONS.write().await = suggestions;
+            });
+
+            // Background self-reflection
+            let sr_client = client.clone();
+            let sr_query = query.to_string();
+            let sr_response = streamed.clone();
+            let sr_gen = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            tokio::spawn(async move {
+                if let Some(improved) = self_reflect(&sr_client, &sr_query, &sr_response).await {
+                    let current_gen = GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+                    if current_gen == sr_gen {
+                        let mut conv = CONVERSATION.write().await;
+                        if let Some(last) = conv.back_mut() {
+                            if last.role == "assistant" && last.content.as_deref() == Some(&sr_response) {
+                                last.content = Some(improved);
+                            }
+                        }
+                    }
+                }
+            });
+            return;
+        }
+    }
+
+    // Try Groq streaming next (fast fallback)
+    // 120s timeout; falls back to parallel racing on failure
     if let Some(streamed) = timeout(Duration::from_secs(120), try_stream_response(client, query, &msg_vec, effective_temp, max_tokens)).await.ok().flatten() {
         cache_put(query, effective_temp, &streamed);
         let assistant = ChatMessage {
@@ -1683,7 +1820,7 @@ pub async fn process_query(
                 let mv = Arc::clone(&msg_vec);
                 futs.push(Box::pin(async move {
                     let (msg, err) = try_model(
-                        || call_nvidia(client, nk_c.clone(), &model_s, &mv, effective_temp, max_tokens, None, None),
+                        || call_nvidia(client, nk_c.clone(), &model_s, &mv, effective_temp, max_tokens, None, None, None),
                         &model_s,
                         1000,
                         12,  // NVIDIA NIM is slower but reliable, give it 12s
@@ -1707,7 +1844,7 @@ pub async fn process_query(
                 let mv = Arc::clone(&msg_vec);
                 futs.push(Box::pin(async move {
                     let (msg, err) = try_model(
-                        || call_nvidia(client, nk_qwen_c.clone(), &model_s, &mv, effective_temp, max_tokens, None, None),
+                        || call_nvidia(client, nk_qwen_c.clone(), &model_s, &mv, effective_temp, max_tokens, None, None, None),
                         &model_s,
                         1000,
                         12,
@@ -1731,7 +1868,7 @@ pub async fn process_query(
                 let mv = Arc::clone(&msg_vec);
                 futs.push(Box::pin(async move {
                     let (msg, err) = try_model(
-                        || call_groq(client, gk.clone(), &model_s, &mv, effective_temp, max_tokens, None, None),
+                        || call_groq(client, gk.clone(), &model_s, &mv, effective_temp, max_tokens, None, None, None),
                         &model_s,
                         1000,
                         4,  // Groq is fast, timeout rapidly
@@ -1756,7 +1893,7 @@ pub async fn process_query(
                 let mv = Arc::clone(&msg_vec);
                 futs.push(Box::pin(async move {
                     let (msg, err) = try_model(
-                        || call_openrouter(client, ak_c.clone(), &model_s, &mv, effective_temp, max_tokens, None, None),
+                        || call_openrouter(client, ak_c.clone(), &model_s, &mv, effective_temp, max_tokens, None, None, None),
                         &model_s,
                         1000,
                         4,  // OpenRouter free models are slow/unreliable, timeout rapidly
@@ -2051,7 +2188,7 @@ pub async fn process_code_query(
             let mut att = Vec::new();
             for model in NVIDIA_MODELS {
                 let (msg, err) = try_model(
-                    || call_nvidia(client, nk.clone(), model, &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone()),
+                    || call_nvidia(client, nk.clone(), model, &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone(), None),
                     model, 1000, 12,
                 ).await;
                 if let Some(m) = msg {
@@ -2077,7 +2214,7 @@ pub async fn process_code_query(
             let mut att = Vec::new();
             for model in GROQ_MODELS {
                 let (msg, err) = try_model(
-                    || call_groq(client, gk_val.clone(), model, &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone()),
+                    || call_groq(client, gk_val.clone(), model, &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone(), None),
                     model, 1000, 4,
                 ).await;
                 if let Some(m) = msg {
@@ -2106,7 +2243,7 @@ pub async fn process_code_query(
             }
             let mut att = Vec::new();
             let (msg, err) = try_model(
-                || call_openrouter(client, ak.clone(), &models[0], &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone()),
+                || call_openrouter(client, ak.clone(), &models[0], &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone(), None),
                 &models[0], 1000, 4,
             ).await;
             if let Some(m) = msg {
@@ -2132,7 +2269,7 @@ pub async fn process_code_query(
             let mut att = Vec::new();
             for model in NVIDIA_QWEN_MODELS {
                 let (msg, err) = try_model(
-                    || call_nvidia(client, nk_qwen.clone(), model, &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone()),
+                    || call_nvidia(client, nk_qwen.clone(), model, &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone(), None),
                     model, 1000, 12,
                 ).await;
                 if let Some(m) = msg {
@@ -2170,7 +2307,7 @@ pub async fn process_code_query(
                 use futures_util::future::join_all;
                 let futs: Vec<_> = remaining.iter().map(|model| {
                     try_model(
-                        || call_openrouter(client, ak.clone(), model, &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone()),
+                        || call_openrouter(client, ak.clone(), model, &messages, effective_temp, max_tokens, tools.clone(), tool_choice.clone(), None),
                         model,
                         1000,
                         4,
@@ -2419,7 +2556,7 @@ mod tests {
     fn test_format_response_plain_text() {
         let result = format_response("Hello world");
         assert!(result.contains("Hello world"));
-        assert!(result.contains("─"));
+        assert!(result.contains("-"));
     }
 
     #[test]
@@ -2434,9 +2571,6 @@ mod tests {
         let result = format_response("this is **bold** text");
         assert!(!result.contains("**bold**"));
         assert!(result.contains("bold"));
-        // Bold text uses bold+yellow/gold for high visibility
-        assert!(result.contains("\x1b[1;33m"));
-        assert!(result.contains("\x1b[0m"));
     }
 
     #[test]
@@ -2451,13 +2585,12 @@ mod tests {
         let result = format_response("run `cmd` now");
         assert!(!result.contains("`cmd`"));
         assert!(result.contains("cmd"));
-        assert!(result.contains("\x1b[0;33m"));
     }
 
     #[test]
     fn test_format_response_empty() {
         let result = format_response("");
-        assert!(result.contains("─"));
+        assert!(result.contains("-"));
     }
 
     // -- http_status_detail tests --
@@ -2658,18 +2791,10 @@ mod tests {
         assert!(result.contains("Bob"));
         assert!(result.contains("Name"));
         assert!(result.contains("Age"));
-        // Box-drawing characters
-        assert!(result.contains("┌"));
-        assert!(result.contains("┐"));
-        assert!(result.contains("├"));
-        assert!(result.contains("┤"));
-        assert!(result.contains("└"));
-        assert!(result.contains("┘"));
-        assert!(result.contains("┴"));
-        // ANSI color codes for header
-        assert!(result.contains("\x1b[1;93m"));
-        // ANSI color codes for data rows
-        assert!(result.contains("\x1b[0;37m"));
+        // ASCII box-drawing characters
+        assert!(result.contains("+"));
+        assert!(result.contains("|"));
+        assert!(result.contains("-"));
     }
 
     #[test]
@@ -2681,11 +2806,9 @@ mod tests {
         let result = format_table_rows(&rows, 80);
         assert!(result.contains("x"));
         assert!(result.contains("y"));
-        // All rows get data color since there's no separator row
-        assert!(result.contains("┌"));
-        assert!(result.contains("└"));
-        // Grid style — separator between the two data rows even without header
-        assert!(result.contains("├"));
+        // ASCII table borders
+        assert!(result.contains("+"));
+        assert!(result.contains("|"));
     }
 
     #[test]
@@ -2709,8 +2832,6 @@ mod tests {
         let result = format_response(input);
         assert!(result.contains("Name"));
         assert!(result.contains("CPU"));
-        // Bold formatting should have ANSI codes
-        assert!(result.contains("\x1b[1;33m"));
     }
 
         // -- demo: before/after table rendering comparison --
@@ -2800,7 +2921,7 @@ mod tests {
         };
         let hrule = |l: &str, m: &str, r: &str| -> String {
             let mut s = String::from(l);
-            for (i, w) in col_widths.iter().enumerate() {
+        for (i, w) in col_widths.iter().enumerate() {
                 s.push_str(&"─".repeat(*w + 2));
                 if i < col_count - 1 { s.push_str(m); }
             }
@@ -2810,10 +2931,10 @@ mod tests {
         let mut out = String::new();
         out.push_str(&format!("\x1b[96m{}\x1b[0m\n", hrule("┌", "┬", "┐")));
         for (idx, row) in parsed_rows.iter().enumerate() {
-            out.push('│');
+            out.push('|');
             for (i, cell) in row.iter().enumerate() {
                 out.push_str(&fmt_cell(cell, col_widths[i], has_header && idx == 0));
-                out.push('│');
+                out.push('|');
             }
             out.push('\n');
             if idx < parsed_rows.len() - 1 {

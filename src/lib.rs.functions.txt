@@ -1,0 +1,97 @@
+&self, f: &mut std::fmt::Formatter<'_>
+&self, serializer: S
+
+
+
+
+
+
+
+
+
+msg: ChatMessage
+
+
+
+
+
+
+query: &str, temperature: f32
+query: &str, temperature: f32
+query: &str, temperature: f32, response: &str
+
+client: &Client, query: &str, response: &str
+s: &str
+client: &Client, query: &str, response: &str
+
+
+status: u16
+
+
+
+
+
+
+
+line: &str
+line: &str
+line: &str
+rows: &[&str], term_w: usize
+resp: &str
+table_buf: &mut Vec<&str>, lines: &mut Vec<String>, term_w: usize
+query: &str
+query: &str
+resp: &str
+resp: &str
+messages: &[ChatMessage], keep_recent: usize
+
+model: &str
+base_ms: u64
+f: F, model: &str, delay_ms: u64, timeout_secs: u64
+
+
+
+fn main","path":"src","include":"*.rs"}}</tool_call>
+
+msgs: &mut Vec<ChatMessage>
+msg: &ChatMessage
+args: &Value
+
+s: &str
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+rows: &[&str], term_w: usize
+
+

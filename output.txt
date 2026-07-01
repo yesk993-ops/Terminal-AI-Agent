@@ -1,0 +1,50 @@
+40:    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+430:fn history_path() -> &'static PathBuf {
+515:fn cache_key(query: &str, temperature: f32) -> u64 {
+522:fn cache_get(query: &str, temperature: f32) -> Option<String> {
+528:fn cache_put(query: &str, temperature: f32, response: &str) {
+570:fn parse_json_array(s: &str) -> Vec<String> {
+632:fn build_project_context() -> String {
+719:fn safe_termwidth() -> usize {
+723:fn http_status_detail(status: u16) -> &'static str {
+735:fn bold_re() -> &'static Regex {
+740:fn heading_re() -> &'static Regex {
+745:fn list_star_re() -> &'static Regex {
+750:fn ansi_re() -> &'static Regex {
+755:fn inline_code_re() -> &'static Regex {
+760:fn shell_cmd_re() -> &'static Regex {
+765:fn acronym_re() -> &'static Regex {
+775:fn is_table_row(line: &str) -> bool {
+781:fn is_table_separator(line: &str) -> bool {
+786:fn parse_table_cells(line: &str) -> Vec<String> {
+798:fn format_table_rows(rows: &[&str], term_w: usize) -> String {
+1014:    fn flush_table(table_buf: &mut Vec<&str>, lines: &mut Vec<String>, term_w: usize) {
+1131:fn auto_temperature(query: &str) -> f32 {
+1170:fn auto_max_tokens(query: &str) -> u32 {
+1185:fn score_response(resp: &str) -> f64 {
+1246:fn post_process_response(resp: &str) -> String {
+1293:fn summarize_old_context(messages: &[ChatMessage], keep_recent: usize) -> Vec<ChatMessage> {
+1344:fn chat_system_prompt() -> &'static str {
+1403:fn mark_model_rate_limited(model: &str) {
+1413:fn jitter_ms(base_ms: u64) -> u64 {
+1848:fn coding_system_prompt() -> String {
+1994:    fn trim_messages(msgs: &mut Vec<ChatMessage>) {
+2025:    fn msg_to_tool_call(msg: &ChatMessage) -> Option<ToolCallText> {
+2335:fn summarize_args(args: &Value) -> String {
+2352:fn tool_call_re() -> &'static Regex {
+2363:fn extract_balanced_json(s: &str) -> Option<&str> {
+2419:    fn test_format_response_plain_text() {
+2426:    fn test_format_response_strips_code_fences() {
+2433:    fn test_format_response_bold_markers_removed() {
+2443:    fn test_format_response_heading_prefix_stripped() {
+2450:    fn test_format_response_inline_code_colored() {
+2458:    fn test_format_response_empty() {
+2466:    fn test_http_401_detail() {
+2471:    fn test_http_429_detail() {
+2476:    fn test_http_unknown_detail() {
+2483:    fn test_safe_termwidth_minimum() {
+2490:    fn test_get_openrouter_key_default_empty() {
+2532:    fn test_auto_temperature_factual() {
+2537:    fn test_auto_temperature_creative() {
+2542:    fn test_auto_temperature_code() {
+2547:    fn test_auto_temperature_default() {
